@@ -44,6 +44,14 @@ class DeepseekV4MegaMoEFP8Experts(nn.Module):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        # dcu_mega_v3 derives per-expert routing scratch capacity from this
+        # value, not only the input buffer length.  Keep SGLang's 8192-token
+        # default headroom so a skewed 4096-token route cannot overrun an
+        # expert tile even though the aggregate token count is in bounds.
+        configured_capacity = int(
+            os.getenv("VLLM_HCU_MEGAMOE_MAX_TOKENS_PER_RANK", "8192")
+        )
+        self.buffer_max_num_tokens = max(self.max_num_tokens, configured_capacity)
         attrs = {"weight_loader": self.weight_loader}
 
         self.w13_weight = nn.Parameter(
@@ -154,6 +162,10 @@ class DeepseekV4MegaMoEFP8Experts(nn.Module):
         self.w2_weight_scale = None
 
     def get_symm_buffer(self):
+        # The standalone runtime consumes this setting while constructing its
+        # symmetric buffer. Scope the safe default to the explicitly selected
+        # MegaMoE path so importing this module cannot affect other backends.
+        os.environ.setdefault("K3_USE_ASM_TAIL_REDUCE", "0")
         import megamoe
 
         group = get_ep_group().device_group
@@ -161,7 +173,7 @@ class DeepseekV4MegaMoEFP8Experts(nn.Module):
             id(group),
             torch.accelerator.current_device_index(),
             self.num_experts,
-            self.max_num_tokens,
+            self.buffer_max_num_tokens,
             self.top_k,
             self.hidden_size,
             self.intermediate_size,
@@ -171,10 +183,12 @@ class DeepseekV4MegaMoEFP8Experts(nn.Module):
             buffer = megamoe.get_symm_buffer_for_mega_moe(
                 group,
                 self.num_experts,
-                self.max_num_tokens,
+                self.buffer_max_num_tokens,
                 self.top_k,
                 self.hidden_size,
                 self.intermediate_size,
+                use_fp8_dispatch=True,
+                activation="swiglu",
             )
             self._symm_buffer_cache[key] = buffer
         return buffer
@@ -215,18 +229,21 @@ class DeepseekV4MegaMoEFP8Experts(nn.Module):
 
         buffer = self.get_symm_buffer()
         num_tokens = hidden_states.shape[0]
-        megamoe.mega_moe_pre_dispatch(
-            hidden_states,
-            topk_ids,
-            topk_weights,
-            buffer.x,
-            buffer.x_sf,
-            buffer.topk_idx,
-            buffer.topk_weights,
-            num_tokens=num_tokens,
+        # Keep input preparation identical to SGLang's standalone W8A8 path.
+        # The fused helper shipped by some dcu_mega_v3 wheels writes full
+        # buffer views and is unsafe when eager decode reuses a 4096-token
+        # symmetric buffer for a much smaller active batch.
+        x_fp8, x_scale = megamoe.cast_to_fp8_channelwise(
+            hidden_states if hidden_states.is_contiguous() else hidden_states.contiguous()
+        )
+        buffer.x[:num_tokens].copy_(x_fp8)
+        buffer.x_sf[:num_tokens].copy_(x_scale)
+        buffer.topk_idx[:num_tokens].copy_(topk_ids.to(buffer.topk_idx.dtype))
+        buffer.topk_weights[:num_tokens].copy_(
+            topk_weights.to(buffer.topk_weights.dtype)
         )
         self.finalize_weights()
-        threshold = int(os.getenv("VLLM_HCU_MEGAMOE_LL_TOKEN_THRESHOLD", "512"))
+        threshold = int(os.getenv("VLLM_HCU_MEGAMOE_LL_TOKEN_THRESHOLD", "496"))
         megamoe.fp8_w8a8_mega_moe(
             output,
             self._transformed_l1_weights,

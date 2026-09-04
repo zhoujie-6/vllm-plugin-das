@@ -26,6 +26,32 @@ def test_megamoe_patch_request_is_explicit() -> None:
     assert patch_deepseek_v4_megamoe._requested(config)
     config.kernel_config.moe_backend = "triton"
     assert not patch_deepseek_v4_megamoe._requested(config)
+    config.kernel_config.moe_backend = "auto"
+    assert not patch_deepseek_v4_megamoe._requested(config)
+
+
+def test_standalone_megamoe_uses_fp8_dispatch_buffer_and_safe_defaults() -> None:
+    source_path = REPO / "vllm_hcu/models/deepseek_v4_megamoe.py"
+    source = source_path.read_text()
+    tree = ast.parse(source)
+
+    buffer_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get_symm_buffer_for_mega_moe"
+    ]
+    assert len(buffer_calls) == 1
+    kwargs = {keyword.arg: keyword.value for keyword in buffer_calls[0].keywords}
+    assert isinstance(kwargs["use_fp8_dispatch"], ast.Constant)
+    assert kwargs["use_fp8_dispatch"].value is True
+    assert isinstance(kwargs["activation"], ast.Constant)
+    assert kwargs["activation"].value == "swiglu"
+
+    assert 'os.environ.setdefault("K3_USE_ASM_TAIL_REDUCE", "0")' in source
+    assert 'VLLM_HCU_MEGAMOE_LL_TOKEN_THRESHOLD", "496"' in source
+    assert 'VLLM_HCU_MEGAMOE_MAX_TOKENS_PER_RANK", "8192"' in source
 
 
 def _load_experts_class():
@@ -77,6 +103,8 @@ def fp8_experts():
 
 
 def test_fp8_initialization_and_weight_loading(fp8_experts) -> None:
+    assert fp8_experts.max_num_tokens == 8
+    assert fp8_experts.buffer_max_num_tokens == 8192
     assert fp8_experts.w13_weight.shape == (2, 256, 128)
     assert fp8_experts.w2_weight.shape == (2, 128, 128)
     assert fp8_experts.w13_weight.dtype == torch.float8_e4m3fn
@@ -133,14 +161,7 @@ def test_fp8_finalize_and_forward_dispatch_never_touch_fp4(
         scale = value.float().abs().amax(dim=-1, keepdim=True).clamp_min(1e-6) / 448
         return (value.float() / scale).clamp(-448, 448).to(torch.float8_e4m3fn), scale
 
-    def pre_dispatch(x, ids, weights, out_x, out_scale, out_ids, out_weights, num_tokens):
-        quantized, scale = cast_to_fp8_channelwise(x)
-        out_x[:num_tokens].copy_(quantized)
-        out_scale[:num_tokens].copy_(scale)
-        out_ids[:num_tokens].copy_(ids.to(out_ids.dtype))
-        out_weights[:num_tokens].copy_(weights.to(out_weights.dtype))
-
-    megamoe.mega_moe_pre_dispatch = pre_dispatch
+    megamoe.cast_to_fp8_channelwise = cast_to_fp8_channelwise
 
     def fp8_kernel(out, l1, l2, buf, **kwargs):
         calls.append("fp8_w8a8")

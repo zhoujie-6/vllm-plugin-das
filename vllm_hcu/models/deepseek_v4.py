@@ -666,6 +666,10 @@ class DeepseekV4MegaMoEExperts(nn.Module):
     def get_symm_buffer(self):
         runtime = "megamoe" if self.expert_dtype == "fp8" else "deep_gemm"
         if self.expert_dtype == "fp8":
+            # MegaMoE consumes this setting while creating the symmetric
+            # buffer. Preserve explicit overrides, but avoid the standalone
+            # ASM tail-reduce path that can VMFault during sustained decode.
+            os.environ.setdefault("K3_USE_ASM_TAIL_REDUCE", "0")
             import megamoe as kernel_module
         else:
             import vllm.third_party.deep_gemm as kernel_module
@@ -692,6 +696,8 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                 self.top_k,
                 self.hidden_size,
                 self.intermediate_size,
+                use_fp8_dispatch=True,
+                activation="swiglu",
             )
             self._symm_buffer_cache[key] = symm_buffer
         return symm_buffer
@@ -770,7 +776,9 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         if self.expert_dtype == "fp8":
             import megamoe
 
-            threshold = int(os.getenv("VLLM_HCU_MEGAMOE_LL_TOKEN_THRESHOLD", "512"))
+            # Keep this in sync with the standalone DCU path and SGLang's
+            # validated normal/LL crossover.
+            threshold = int(os.getenv("VLLM_HCU_MEGAMOE_LL_TOKEN_THRESHOLD", "496"))
             backend = "ll" if num_tokens <= threshold else "normal"
             megamoe.fp8_w8a8_mega_moe(
                 y,
