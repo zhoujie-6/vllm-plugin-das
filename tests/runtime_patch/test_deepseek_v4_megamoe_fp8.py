@@ -134,9 +134,15 @@ def test_fp8_initialization_and_weight_loading(fp8_experts) -> None:
     assert torch.equal(fp8_experts.w13_weight_scale[1, :128], scale)
 
 
+@pytest.mark.parametrize("num_tokens", [1, 3, 8])
+@pytest.mark.parametrize("capturing", [False, True])
+@pytest.mark.parametrize("threshold", [2, 496])
 def test_fp8_finalize_and_forward_dispatch_never_touch_fp4(
-    fp8_experts, monkeypatch: pytest.MonkeyPatch
+    fp8_experts, monkeypatch: pytest.MonkeyPatch, capturing: bool, threshold: int,
+    num_tokens: int,
 ) -> None:
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    monkeypatch.setenv("VLLM_HCU_MEGAMOE_LL_TOKEN_THRESHOLD", str(threshold))
     calls: list[str] = []
     torch.manual_seed(7)
     fp8_experts.w13_weight.data.copy_(
@@ -149,6 +155,8 @@ def test_fp8_finalize_and_forward_dispatch_never_touch_fp4(
     fp8_experts.w2_weight_scale.data.fill_(0.01)
 
     class Buffer:
+        cuda_graph_max_tokens_per_rank = 8192
+        cuda_graph_num_tokens = torch.tensor([8192], dtype=torch.int32)
         x = torch.empty((8, 128), dtype=torch.float8_e4m3fn)
         x_sf = torch.empty((8, 1), dtype=torch.float32)
         topk_idx = torch.empty((8, 1), dtype=torch.int32)
@@ -165,6 +173,14 @@ def test_fp8_finalize_and_forward_dispatch_never_touch_fp4(
 
     def fp8_kernel(out, l1, l2, buf, **kwargs):
         calls.append("fp8_w8a8")
+        assert kwargs.get("graph", False) is capturing
+        assert kwargs["megamoe_backend"] == ("ll" if out.shape[0] <= threshold else "normal")
+        assert kwargs["capacity_num_tokens"] == out.shape[0]
+        if capturing:
+            assert buf.cuda_graph_max_tokens_per_rank == out.shape[0]
+            assert buf.cuda_graph_num_tokens.item() == out.shape[0]
+        else:
+            assert buf.cuda_graph_max_tokens_per_rank == 8192
         assert kwargs["recipe"] == (1, 1, 32)
         assert kwargs["activation"] == "swiglu"
         x = buf.x[: out.shape[0]].float() * buf.x_sf[: out.shape[0]]
@@ -179,13 +195,14 @@ def test_fp8_finalize_and_forward_dispatch_never_touch_fp4(
     megamoe.fp8_w8a8_mega_moe = fp8_kernel
     monkeypatch.setitem(sys.modules, megamoe.__name__, megamoe)
     monkeypatch.setattr(fp8_experts, "_check_runtime_supported", lambda: None)
-    monkeypatch.setattr(fp8_experts, "get_symm_buffer", Buffer)
+    buffer = Buffer()
+    monkeypatch.setattr(fp8_experts, "get_symm_buffer", lambda: buffer)
 
     fp8_experts.finalize_weights()
     assert fp8_experts._transformed_l1_weights["unified"][1].shape == (2, 256)
     assert fp8_experts._transformed_l2_weights["unified"][1].shape == (2, 128)
 
-    hidden = torch.randn((3, 128), dtype=torch.bfloat16)
+    hidden = torch.randn((num_tokens, 128), dtype=torch.bfloat16)
     w13 = fp8_experts._transformed_l1_weights
     w2 = fp8_experts._transformed_l2_weights
     w13 = w13["unified"]
@@ -200,13 +217,47 @@ def test_fp8_finalize_and_forward_dispatch_never_touch_fp4(
     out = torch.empty_like(hidden)
     fp8_experts._run(
         hidden,
-        torch.ones((3, 1), dtype=torch.float32),
-        torch.zeros((3, 1), dtype=torch.int64),
+        torch.ones((num_tokens, 1), dtype=torch.float32),
+        torch.zeros((num_tokens, 1), dtype=torch.int64),
         out,
         None,
         True,
     )
+    assert buffer.cuda_graph_max_tokens_per_rank == 8192
     assert calls == ["fp8_w8a8"]
     error = (out.float() - reference).abs().mean()
     reference_magnitude = reference.abs().mean().clamp_min(1e-6)
     assert error / reference_magnitude < 0.05
+
+
+def test_graph_capacity_restored_after_kernel_failure(fp8_experts, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    buffer = SimpleNamespace(
+        x=torch.empty((8, 128), dtype=torch.float8_e4m3fn),
+        x_sf=torch.empty((8, 1)),
+        topk_idx=torch.empty((8, 1), dtype=torch.int64),
+        topk_weights=torch.empty((8, 1)),
+        cuda_graph_max_tokens_per_rank=8192,
+        cuda_graph_num_tokens=torch.tensor([8192], dtype=torch.int32),
+    )
+    monkeypatch.setattr(fp8_experts, "get_symm_buffer", lambda: buffer)
+    monkeypatch.setattr(fp8_experts, "finalize_weights", lambda: None)
+    megamoe = ModuleType("megamoe")
+    megamoe.cast_to_fp8_channelwise = lambda x: (
+        x.to(torch.float8_e4m3fn), torch.ones((x.shape[0], 1))
+    )
+
+    def fail(*args, **kwargs):
+        assert kwargs["graph"] is True
+        assert buffer.cuda_graph_max_tokens_per_rank == 3
+        raise RuntimeError("simulated kernel failure")
+
+    megamoe.fp8_w8a8_mega_moe = fail
+    monkeypatch.setitem(sys.modules, "megamoe", megamoe)
+    hidden = torch.ones((3, 128), dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="simulated kernel failure"):
+        fp8_experts._run(
+            hidden, torch.ones((3, 1)), torch.zeros((3, 1), dtype=torch.int64),
+            torch.empty_like(hidden), None, True,
+        )
+    assert buffer.cuda_graph_max_tokens_per_rank == 8192

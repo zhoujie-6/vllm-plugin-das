@@ -244,18 +244,36 @@ class DeepseekV4MegaMoEFP8Experts(nn.Module):
         )
         self.finalize_weights()
         threshold = int(os.getenv("VLLM_HCU_MEGAMOE_LL_TOKEN_THRESHOLD", "496"))
-        megamoe.fp8_w8a8_mega_moe(
-            output,
-            self._transformed_l1_weights,
-            self._transformed_l2_weights,
-            buffer,
-            recipe=(1, 1, 32),
-            activation="swiglu",
-            megamoe_backend="ll" if num_tokens <= threshold else "normal",
-            capacity_num_tokens=num_tokens,
-            activation_clamp=activation_clamp,
-            fast_math=fast_math,
-        )
+        graph = torch.cuda.is_current_stream_capturing()
+        graph_kwargs = {}
+        if graph:
+            # vLLM captures a fixed, padded token bucket on every EP rank.
+            # Record the count update in the graph: Python is not run during
+            # replay, and other captured buckets share this symmetric buffer.
+            buffer.cuda_graph_num_tokens.fill_(num_tokens)
+            # Keep the large routing scratch allocation, but specialize graph
+            # launches to the current output shape, not its 8192-token capacity.
+            graph_capacity = buffer.cuda_graph_max_tokens_per_rank
+            buffer.cuda_graph_max_tokens_per_rank = num_tokens
+            graph_kwargs["graph"] = True
+        try:
+            megamoe.fp8_w8a8_mega_moe(
+                output,
+                self._transformed_l1_weights,
+                self._transformed_l2_weights,
+                buffer,
+                recipe=(1, 1, 32),
+                activation="swiglu",
+                megamoe_backend="ll" if num_tokens <= threshold else "normal",
+                capacity_num_tokens=num_tokens,
+                activation_clamp=activation_clamp,
+                fast_math=fast_math,
+                **graph_kwargs,
+            )
+        finally:
+            if graph:
+                buffer.cuda_graph_max_tokens_per_rank = graph_capacity
+
 
 
 DeepseekV4MegaMoEFP8Experts.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]
