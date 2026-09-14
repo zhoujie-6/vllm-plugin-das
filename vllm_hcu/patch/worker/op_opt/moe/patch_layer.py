@@ -190,6 +190,23 @@ def apply_to_module(module: ModuleType) -> bool:
                 # Kimi W4A8 quant method consumes the preserved beta values
                 # below and dispatches the actual SiTu kernel itself.
                 kwargs["activation"] = "silu"
+        from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4_pcp
+
+        config_module = sys.modules.get("vllm.config")
+        get_current_config = getattr(
+            config_module, "get_current_vllm_config_or_none", None
+        )
+        config = get_current_config() if callable(get_current_config) else None
+        if (
+            is_deepseek_v4_pcp(config)
+            and config.parallel_config.enable_eplb
+        ):
+            bound = inspect.signature(factory).bind(*args, **kwargs)
+            bound.arguments["enable_eplb"] = True
+            bound.arguments["num_redundant_experts"] = (
+                config.parallel_config.eplb_config.num_redundant_experts
+            )
+            args, kwargs = bound.args, bound.kwargs
         runner = factory(*args, **kwargs)
         if kwargs.get("activation") == "silu" and situ_beta is not None:
             # Keep the semantic activation visible to the Kimi quant method;

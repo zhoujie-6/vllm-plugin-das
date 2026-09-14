@@ -153,7 +153,10 @@ def use_all2all_kernels(parallel_config: object) -> bool:
     # i.e. plain RCCL, and the DeepEP manager sits idle).
     pcp_size = int(getattr(parallel_config, "pcp_size", 1) or 1)
     backend = getattr(parallel_config, "all2all_backend", None)
-    return pcp_size > 1 and backend in _PCP_EP_DEEPEP_BACKENDS
+    return pcp_size > 1 and (
+        bool(getattr(parallel_config, "_hcu_v4_pcp", False))
+        or backend in _PCP_EP_DEEPEP_BACKENDS
+    )
 
 
 def use_deepep_auto_kernels(parallel_config: object) -> bool:

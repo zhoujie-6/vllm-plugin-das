@@ -18,6 +18,7 @@ from vllm_hcu.patch.import_coordinator import (
 
 from . import (
     patch_compilation_config,
+    patch_deepseek_v4_pcp_parallel,
     patch_engine_args,
     patch_envs,
     patch_hy_v4_model_arch_config,
@@ -48,6 +49,7 @@ _ORDERED_ADAPTERS = (
     patch_nixl_utils,
     patch_engine_args,
     patch_compilation_config,
+    patch_deepseek_v4_pcp_parallel,
     patch_vllm_config,
     patch_kimi_k3_config,
     patch_kimi_k3_model_config,

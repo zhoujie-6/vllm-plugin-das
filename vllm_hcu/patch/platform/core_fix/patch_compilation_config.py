@@ -25,6 +25,11 @@ _MARKER = "_vllm_hcu_compilation_cudagraph_patch_applied"
 _HCU_CUDAGRAPH_UNSAFE_SPLITTING_OPS = (
     "vllm::hcu_sparse_attn_indexer",
 )
+_V4_PCP_SPLITTING_OPS = (
+    "vllm::hcu_deepseek_v4_pcp_attention",
+    "vllm::hcu_deepseek_v4_pcp_moe",
+)
+_BOUND_V4_PCP: set[int] = set()
 _BOUND_CONFIGS_LOCK = threading.RLock()
 _BOUND_CONFIGS: dict[
     int,
@@ -68,6 +73,7 @@ def bind_hcu_config(vllm_config: object) -> HcuFeatureConfig:
             current = _BOUND_CONFIGS.get(key)
             if current is not None and current[0] is reference:
                 _BOUND_CONFIGS.pop(key, None)
+                _BOUND_V4_PCP.discard(key)
 
     try:
         reference = weakref.ref(compilation_config, remove_binding)
@@ -77,6 +83,11 @@ def bind_hcu_config(vllm_config: object) -> HcuFeatureConfig:
         ) from exc
     with _BOUND_CONFIGS_LOCK:
         _BOUND_CONFIGS[key] = (reference, feature_config)
+        from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4_pcp
+        if is_deepseek_v4_pcp(vllm_config):
+            _BOUND_V4_PCP.add(key)
+        else:
+            _BOUND_V4_PCP.discard(key)
     return feature_config
 
 
@@ -210,7 +221,11 @@ def apply_to_module(module: ModuleType) -> bool:
                 "CompilationConfig.splitting_ops must be finalized as a list "
                 "before HCU unsafe operators are registered"
             )
-        for op_name in _HCU_CUDAGRAPH_UNSAFE_SPLITTING_OPS:
+        unsafe_ops = _HCU_CUDAGRAPH_UNSAFE_SPLITTING_OPS
+        with _BOUND_CONFIGS_LOCK:
+            if id(self) in _BOUND_V4_PCP:
+                unsafe_ops += _V4_PCP_SPLITTING_OPS
+        for op_name in unsafe_ops:
             if op_name not in splitting_ops:
                 splitting_ops.append(op_name)
         return result

@@ -26,4 +26,11 @@ def is_dspark_enabled(vllm_config: object | None) -> bool:
     return getattr(speculative_config, "method", None) == "dspark"
 
 
+def is_deepseek_v4_pcp(vllm_config: object | None) -> bool:
+    return is_deepseek_v4(vllm_config) and int(getattr(
+        getattr(vllm_config, "parallel_config", None),
+        "prefill_context_parallel_size", 1,
+    )) > 1
+
+
 __all__ = ["is_deepseek_v4", "is_dspark_enabled", "model_architectures"]
