@@ -171,6 +171,21 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         raise ValueError("FlashAttention PCP does not support multi-layer MTP.")
 
 
+def _require_deepseek_v4_pcp_contract(vllm_config: object) -> None:
+    """Full KV constraints inherited from the DeepSeek-V4 PCP source branch."""
+    pc = vllm_config.parallel_config
+    if pc.decode_context_parallel_size != 1:
+        raise ValueError("DeepSeek-V4 PCP Full KV does not support DCP.")
+    if pc.cp_kv_cache_interleave_size != 1:
+        raise ValueError("DeepSeek-V4 PCP requires cp_kv_cache_interleave_size=1.")
+    if vllm_config.kv_transfer_config is not None:
+        raise ValueError("DeepSeek-V4 PCP does not support KV transfer or P/D disaggregation.")
+    if get_hcu_config(vllm_config).enable_lightly_cp:
+        raise ValueError("DeepSeek-V4 PCP and lightly-CP are mutually exclusive.")
+    if is_dspark_enabled(vllm_config):
+        raise ValueError("DeepSeek-V4 PCP+DSpark is outside the source PCP support scope.")
+
+
 def _validate_hcu_pcp_scope(vllm_config: object) -> bool:
     """Return whether this configuration is in the HCU PCP support scope."""
 
@@ -183,7 +198,10 @@ def _validate_hcu_pcp_scope(vllm_config: object) -> bool:
     if pcp_size <= 1:
         return False
 
-    _require_mrv2_pcp_contract(vllm_config)
+    if is_deepseek_v4(vllm_config):
+        _require_deepseek_v4_pcp_contract(vllm_config)
+    else:
+        _require_mrv2_pcp_contract(vllm_config)
     return True
 
 

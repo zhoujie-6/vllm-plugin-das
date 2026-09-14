@@ -190,6 +190,14 @@ def apply_to_module(module: ModuleType) -> bool:
                 if vllm_config is not None
                 else False
             )
+        # V4 PCP shards MoE tokens even when DP=TP=1. Enable DeepEP for
+        # that model only; GLM PCP keeps its existing dispatch contract.
+        from vllm.config import get_current_vllm_config_or_none
+        from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4_pcp
+
+        result._hcu_v4_pcp = is_deepseek_v4_pcp(
+            get_current_vllm_config_or_none()
+        )
         if deepep_auto:
             result.all2all_backend = "deepep_auto"
             logger = getattr(target, "logger", None)

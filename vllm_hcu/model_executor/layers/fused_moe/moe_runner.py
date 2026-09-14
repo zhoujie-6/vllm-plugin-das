@@ -356,6 +356,9 @@ class MoERunner(MoERunnerInterface):
     ):
         super().__init__()
         self.moe_config = moe_config
+        from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4_pcp
+        self._hcu_v4_pcp = is_deepseek_v4_pcp(get_current_vllm_config())
+        self._hcu_v4_pcp_ep = self._hcu_v4_pcp and moe_config.moe_parallel_config.use_ep
         self.router = router
         self.routed_input_transform = routed_input_transform
         self.routed_output_transform = routed_output_transform
@@ -978,7 +981,9 @@ class MoERunner(MoERunnerInterface):
         # NOTE: this will be removed once all kernels are migrated into the
         # MoEKernel framework.
         if router_logits is None and (
-            self.do_naive_dispatch_combine or self.moe_config.pcp_size > 1
+            self.do_naive_dispatch_combine
+            or (self.moe_config.pcp_size > 1
+                and not getattr(self, "_hcu_v4_pcp_ep", False))
         ):
             raise RuntimeError(
                 "HCU preselected routing without router_logits is incompatible "
@@ -998,6 +1003,7 @@ class MoERunner(MoERunnerInterface):
         # we should modify All2AllManager abstraction to better support PCP.
         needs_fallback_pcp_collective = (
             self.moe_config.pcp_size > 1
+            and not getattr(self, "_hcu_v4_pcp_ep", False)
             and not self.moe_config.moe_parallel_config.use_all2all_kernels
         )
         if needs_fallback_pcp_collective:
@@ -1024,6 +1030,7 @@ class MoERunner(MoERunnerInterface):
 
         needs_fallback_pcp_collective = (
             self.moe_config.pcp_size > 1
+            and not getattr(self, "_hcu_v4_pcp_ep", False)
             and not self.moe_config.moe_parallel_config.use_all2all_kernels
         )
         if needs_fallback_pcp_collective:
@@ -1063,7 +1070,11 @@ class MoERunner(MoERunnerInterface):
         """
         if (
             quanted_hidden_states is not None or topk_weights is not None
-        ) and (self.do_naive_dispatch_combine or self.moe_config.pcp_size > 1):
+        ) and (
+            self.do_naive_dispatch_combine
+            or (self.moe_config.pcp_size > 1
+                and not getattr(self, "_hcu_v4_pcp_ep", False))
+        ):
             raise RuntimeError(
                 "HCU pre-quantized/preselected MoE inputs cannot be combined "
                 "with naive DP/EP or PCP dispatch because those auxiliary "
@@ -1098,10 +1109,33 @@ class MoERunner(MoERunnerInterface):
             # TODO(bnell): parts of the dispatch/combine steps will go away once
             # #32567 lands and the remaining kernels are made MKs.  The PCP
             # code will probably remain
-            hidden_states, router_logits = self._maybe_dispatch(
-                hidden_states,
-                router_logits,
+            v4_hash_dispatch = (
+                getattr(self, "_hcu_v4_pcp", False)
+                and input_ids is not None and self.do_naive_dispatch_combine
             )
+            if v4_hash_dispatch:
+                # The token-ID sidecar must use the very same variable-size
+                # EP dispatch as activations, including across DP replicas.
+                hidden_states, router_logits, extra = get_ep_group().dispatch_router_logits(
+                    hidden_states, router_logits,
+                    self.moe_config.is_sequence_parallel,
+                    extra_tensors=[input_ids],
+                )
+                input_ids = extra[0]
+                if (self.moe_config.pcp_size > 1
+                        and not getattr(self, "_hcu_v4_pcp_ep", False)
+                        and not self.moe_config.moe_parallel_config.use_all2all_kernels):
+                    hidden_states = get_pcp_group().all_gather(hidden_states, dim=0)
+                    router_logits = get_pcp_group().all_gather(router_logits, dim=0)
+            else:
+                hidden_states, router_logits = self._maybe_dispatch(
+                    hidden_states, router_logits,
+                )
+            if (getattr(self, "_hcu_v4_pcp", False) and input_ids is not None
+                    and self.moe_config.pcp_size > 1
+                    and not getattr(self, "_hcu_v4_pcp_ep", False)
+                    and not self.moe_config.moe_parallel_config.use_all2all_kernels):
+                input_ids = get_pcp_group().all_gather(input_ids, dim=0)
 
             shared_output, hidden_states = self._apply_quant_method(
                 hidden_states=hidden_states,

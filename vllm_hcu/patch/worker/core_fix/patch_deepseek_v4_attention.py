@@ -124,6 +124,10 @@ def apply_to_module(module: ModuleType) -> bool:
         topk_indices_buffer=None,
         aux_stream_list=None,
     ):
+        from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4_pcp
+        self._hcu_v4_pcp = is_deepseek_v4_pcp(vllm_config)
+        if self._hcu_v4_pcp:
+            from vllm_hcu.model_executor.layers import deepseek_v4_pcp  # noqa: F401
         quant_config = getattr(vllm_config, "quant_config", None)
         if not _requires_unquantized_int8_wo_a(vllm_config):
             return original_init(
@@ -160,6 +164,13 @@ def apply_to_module(module: ModuleType) -> bool:
         hidden_states,
         llama_4_scaling=None,
     ):
+        if getattr(self, "_hcu_v4_pcp", False):
+            return torch.ops.vllm.hcu_deepseek_v4_pcp_attention(
+                hidden_states, positions, self.prefix,
+            )
+        return hcu_non_pcp_forward(self, positions, hidden_states, llama_4_scaling)
+
+    def hcu_non_pcp_forward(self, positions, hidden_states, llama_4_scaling=None):
         # Upstream normalizes QR and KV together before attention_impl. The
         # uint8 LightOp insert owns KVNorm itself, so keep KV raw here and let
         # the insert wrapper normalize it only for official non-uint8 caches.
@@ -303,6 +314,7 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(cls, "_vllm_hcu_original_attn_gemm_parallel_execute", original)
     setattr(cls, "_vllm_hcu_original_fused_qnorm_rope_kv_insert", original_insert)
     setattr(cls, "__init__", hcu_attention_init)
+    setattr(cls, "_vllm_hcu_non_pcp_forward", hcu_non_pcp_forward)
     setattr(cls, "forward", hcu_attention_forward)
     setattr(cls, "attn_gemm_parallel_execute", hcu_attn_gemm_parallel_execute)
     setattr(cls, "_fused_qnorm_rope_kv_insert", hcu_fused_qnorm_rope_kv_insert)

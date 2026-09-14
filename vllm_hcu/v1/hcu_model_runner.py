@@ -3653,7 +3653,11 @@ class GPUModelRunner(
             # These will be copied into input_ids in the next step
             # when preparing inputs.
             # With spec decoding, this is done in propose_draft_token_ids().
-            if self.input_batch.prev_sampled_token_ids is None:
+            from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4_pcp
+            if (self.input_batch.prev_sampled_token_ids is None
+                    or is_deepseek_v4_pcp(self.vllm_config)):
+                # PCP ranks can start with an empty batch. Refresh the tensor
+                # when subsequent steps acquire requests (vllm-hcu 47edf3a5).
                 assert sampled_token_ids.shape[-1] == 1
                 self.input_batch.prev_sampled_token_ids = sampled_token_ids
             self.input_batch.prev_req_id_to_index = {
@@ -6800,9 +6804,10 @@ class GPUModelRunner(
                 continue
             block_size = kv_cache_group.kv_cache_spec.block_size
             block_sizes.append(block_size)
-            max_num_blocks_per_req = cdiv(
-                max_model_len, block_size * get_total_cp_world_size()
-            )
+            from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4_pcp
+            cp_width = (1 if is_deepseek_v4_pcp(self.vllm_config)
+                        else get_total_cp_world_size())
+            max_num_blocks_per_req = cdiv(max_model_len, block_size * cp_width)
             if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
                 max_num_blocks_per_req = (
                     max_num_blocks_per_req

@@ -1342,22 +1342,41 @@ def rocm_aiter_sparse_attn_indexer_native(
                 #     token_to_seq=chunk.token_to_seq,
                 # )
 
+            pcp_plan = getattr(layer_attn_metadata, "hcu_v4_pcp_plan", None)
+            pcp_rows = None
+            ks = chunk.cu_seqlen_ks
+            ke = chunk.cu_seqlen_ke
+            q_chunk = q_fp8[chunk.token_start:chunk.token_end]
+            w_chunk = weights[chunk.token_start:chunk.token_end]
+            if pcp_plan is not None:
+                nd = layer_attn_metadata.hcu_v4_num_decode_tokens
+                owned = pcp_plan.local_indices + nd
+                owned = owned[(owned >= chunk.token_start) & (owned < chunk.token_end)]
+                if owned.numel() == 0:
+                    continue
+                pcp_rows = owned - chunk.token_start
+                q_chunk = q_chunk.index_select(0, pcp_rows)
+                w_chunk = w_chunk.index_select(0, pcp_rows)
+                ks = ks.index_select(0, pcp_rows)
+                ke = ke.index_select(0, pcp_rows)
             logits_fn = fp8_mqa_logits_torch if v4_fp8_fallback else rocm_fp8_mqa_logits
             logits = logits_fn(
-                q_fp8[chunk.token_start : chunk.token_end],
+                q_chunk,
                 (k_fp8, k_scale.view(torch.float32)),
-                weights[chunk.token_start : chunk.token_end],
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
+                w_chunk,
+                ks,
+                ke,
             )
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
+            if pcp_rows is not None:
+                topk_indices = topk_indices.new_empty((pcp_rows.numel(), topk_tokens))
             if _use_lightop_sparse_mla_topk():
                 _lightop_topk_indices_prefill(
                     logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
+                    ks,
+                    ke,
                     topk_indices,
                     topk_tokens,
                 )
@@ -1366,9 +1385,14 @@ def rocm_aiter_sparse_attn_indexer_native(
                     _topk_indices_torch(
                         logits,
                         topk_tokens,
-                        chunk.cu_seqlen_ks,
-                        chunk.cu_seqlen_ke,
+                        ks,
+                        ke,
                     )
+                )
+
+            if pcp_rows is not None:
+                topk_indices_buffer[:, :topk_tokens].index_copy_(
+                    0, owned, topk_indices,
                 )
 
     if has_decode:

@@ -188,6 +188,7 @@ class DeepseekSparseSWAMetadata:
     num_prefills: int = 0
     num_decode_tokens: int = 0
     num_prefill_tokens: int = 0
+    hcu_v4_pcp_plan: object | None = None
 
     # Pre-computed prefill metadata shared across all DeepseekV4 attention layers.
     prefill_seq_lens: torch.Tensor | None = None
@@ -524,7 +525,13 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # resulting plan for the rest of the step.
         tile_sched = self.build_tile_scheduler(num_decode_tokens)
 
+        from vllm_hcu.v1.deepseek_v4_pcp import build_metadata_plan
+
         return DeepseekSparseSWAMetadata(
+            hcu_v4_pcp_plan=build_metadata_plan(
+                self.vllm_config, num_decodes, num_prefills,
+                query_start_loc_cpu, seq_lens.device,
+            ),
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
             query_start_loc_cpu=query_start_loc_cpu,

@@ -176,6 +176,18 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(factory)
     def hcu_factory(*args, **kwargs):
+        from vllm.config import get_current_vllm_config_or_none
+        from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4_pcp
+        config = get_current_vllm_config_or_none()
+        if (is_deepseek_v4_pcp(config)
+                and config.parallel_config.enable_eplb):
+            import inspect
+            bound = inspect.signature(factory).bind(*args, **kwargs)
+            bound.arguments["enable_eplb"] = True
+            bound.arguments["num_redundant_experts"] = (
+                config.parallel_config.eplb_config.num_redundant_experts
+            )
+            args, kwargs = bound.args, bound.kwargs
         runner = factory(*args, **kwargs)
         experts = runner.routed_experts
         if type(experts.quant_method) is not official_unquantized_cls:

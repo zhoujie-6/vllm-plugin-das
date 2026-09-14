@@ -18,6 +18,7 @@ from vllm_hcu.patch.import_coordinator import (
 
 from . import (
     patch_compilation_config,
+    patch_deepseek_v4_pcp_parallel,
     patch_engine_args,
     patch_envs,
     patch_hy_v3_reasoning_parser,
@@ -38,6 +39,7 @@ _ORDERED_ADAPTERS = (
     patch_nixl_utils,
     patch_engine_args,
     patch_compilation_config,
+    patch_deepseek_v4_pcp_parallel,
     patch_vllm_config,
     patch_slimquant_registry,
     patch_hy_v3_reasoning_parser,
