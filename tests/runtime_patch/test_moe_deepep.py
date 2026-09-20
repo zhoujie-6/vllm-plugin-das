@@ -3960,12 +3960,13 @@ def test_deepep_ht_preserves_channel_quant_dispatch_contract(use_fp8: bool):
             return values, device
 
     dispatched = {}
+    layout = {}
 
     class Buffer:
         capture = False
 
         def get_dispatch_layout(self, **kwargs):
-            del kwargs
+            layout.update(kwargs)
             return None, None, None, None, SimpleNamespace(event=None)
 
         def dispatch(self, **kwargs):
@@ -4057,6 +4058,10 @@ def test_deepep_ht_preserves_channel_quant_dispatch_contract(use_fp8: bool):
         quant_config,
         False,
     )
+    assert layout["async_finish"] is False
+    assert layout["allocate_on_comm_stream"] is False
+    assert dispatched["async_finish"] is False
+    assert dispatched["allocate_on_comm_stream"] is False
     assert dispatched["expert_alignment"] == (1 if use_fp8 else 256)
     expert_x, expert_scale, metadata, _, _ = receiver()
     if use_fp8:
@@ -4066,6 +4071,129 @@ def test_deepep_ht_preserves_channel_quant_dispatch_contract(use_fp8: bool):
         assert expert_x is captured["tokens"]
         assert expert_scale is captured["token_scales"]
     assert metadata[0] == [1]
+
+
+def test_deepep_ht_async_prepare_keeps_layout_and_dispatch_on_comm_stream():
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+
+    calls: dict[str, dict[str, object]] = {}
+    event = SimpleNamespace(event=None)
+
+    class Buffer:
+        capture = object()
+
+        def get_dispatch_layout(self, **kwargs):
+            calls["layout"] = kwargs
+            return None, None, None, None, event
+
+        def dispatch(self, **kwargs):
+            calls["dispatch"] = kwargs
+            return kwargs["x"], None, None, [0], "handle", event
+
+    module = SimpleNamespace(
+        dbo_get_previous_event=lambda capture: "captured-event",
+        dbo_yield_and_switch_from_compute_to_comm=lambda: None,
+        dbo_switch_to_compute_sync=lambda: None,
+        dbo_enabled=lambda: False,
+        dbo_current_ubatch_id=lambda: 0,
+    )
+    instance = SimpleNamespace(
+        buffer=Buffer(),
+        async_prepare=True,
+        handles=[None],
+        _get_dispatch_config=lambda: "config",
+        _receiver=lambda *args, **kwargs: None,
+    )
+    quant_config = SimpleNamespace(
+        use_int8_w8a8=False,
+        use_fp8_w8a8=False,
+        is_per_act_token=False,
+        is_block_quantized=False,
+        quant_dtype=None,
+        _vllm_hcu_channel_fp8_deepgemm=False,
+    )
+
+    receiver = deepep_runtime.ht_do_dispatch(
+        module,
+        instance,
+        torch.ones((1, 4)),
+        None,
+        torch.zeros((1, 1), dtype=torch.int64),
+        torch.ones((1, 1)),
+        1,
+        None,
+        quant_config,
+        False,
+    )
+
+    assert callable(receiver)
+    assert calls["layout"]["previous_event"] == "captured-event"
+    assert calls["layout"]["async_finish"] is True
+    assert calls["layout"]["allocate_on_comm_stream"] is True
+    assert calls["dispatch"]["previous_event"] is event
+    assert calls["dispatch"]["async_finish"] is True
+    assert calls["dispatch"]["allocate_on_comm_stream"] is True
+    assert instance.handles == ["handle"]
+
+
+def test_deepep_ht_eager_without_previous_event_uses_sync_dispatch():
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+
+    calls = {}
+    event = SimpleNamespace(event=None)
+
+    class Buffer:
+        capture = False
+
+        def get_dispatch_layout(self, **kwargs):
+            calls["layout"] = kwargs
+            return None, None, None, None, event
+
+        def dispatch(self, **kwargs):
+            calls["dispatch"] = kwargs
+            return kwargs["x"], None, None, [0], "handle", event
+
+    module = SimpleNamespace(
+        dbo_get_previous_event=lambda capture: None,
+        dbo_yield_and_switch_from_compute_to_comm=lambda: None,
+        dbo_switch_to_compute_sync=lambda: None,
+        dbo_enabled=lambda: False,
+        dbo_current_ubatch_id=lambda: 0,
+    )
+    instance = SimpleNamespace(
+        buffer=Buffer(),
+        async_prepare=True,
+        handles=[None],
+        _get_dispatch_config=lambda: "config",
+        _receiver=lambda *args, **kwargs: None,
+    )
+    quant_config = SimpleNamespace(
+        use_int8_w8a8=False,
+        use_fp8_w8a8=False,
+        is_per_act_token=False,
+        is_block_quantized=False,
+        quant_dtype=None,
+        _vllm_hcu_channel_fp8_deepgemm=False,
+    )
+
+    deepep_runtime.ht_do_dispatch(
+        module,
+        instance,
+        torch.ones((1, 4)),
+        None,
+        torch.zeros((1, 1), dtype=torch.int64),
+        torch.ones((1, 1)),
+        1,
+        None,
+        quant_config,
+        False,
+    )
+
+    assert calls["layout"]["previous_event"] is None
+    assert calls["layout"]["async_finish"] is False
+    assert calls["layout"]["allocate_on_comm_stream"] is False
+    assert calls["dispatch"]["async_finish"] is False
+    assert calls["dispatch"]["allocate_on_comm_stream"] is False
 
 
 def test_router_factory_feature_gated_hcu_subclass_contract(

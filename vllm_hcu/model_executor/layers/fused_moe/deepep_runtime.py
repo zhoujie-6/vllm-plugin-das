@@ -194,19 +194,27 @@ def ht_do_dispatch(
 ):
     has_scales = token_scales is not None
     previous_event = module.dbo_get_previous_event(self.buffer.capture)
+    # DeepEP requires an event whenever layout/dispatch is launched
+    # asynchronously. Eager execution (including the startup profile run) has
+    # no graph-capture event, so fall back to the synchronous path there.
+    async_dispatch = (
+        self.async_prepare
+        and previous_event is not None
+        and not module.dbo_enabled()
+    )
     module.dbo_yield_and_switch_from_compute_to_comm()
     (
         num_tokens_per_rank,
         num_tokens_per_rdma_rank,
         dispatch_expert_num_tokens,
         is_token_in_rank,
-        event,
+        layout_event,
     ) = self.buffer.get_dispatch_layout(
         topk_idx=rank_topk_ids,
         num_experts=num_experts,
         previous_event=previous_event,
-        async_finish=False,
-        allocate_on_comm_stream=False,
+        async_finish=async_dispatch,
+        allocate_on_comm_stream=async_dispatch,
     )
     token_data = (tokens, token_scales) if has_scales else tokens
     post_dispatch_channel_fp8 = _uses_post_dispatch_channel_fp8_quant(
@@ -246,9 +254,9 @@ def ht_do_dispatch(
         # every other per-token quantization path.
         expert_alignment=expert_alignment,
         config=self._get_dispatch_config(),
-        previous_event=previous_event,
-        async_finish=self.async_prepare and not module.dbo_enabled(),
-        allocate_on_comm_stream=False,
+        previous_event=layout_event,
+        async_finish=async_dispatch,
+        allocate_on_comm_stream=async_dispatch,
     )
     self.handles[module.dbo_current_ubatch_id()] = handle
     module.dbo_switch_to_compute_sync()
