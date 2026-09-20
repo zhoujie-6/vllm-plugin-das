@@ -1104,15 +1104,10 @@ def _lightop_topk_indices_prefill(
             device=topk_indices.device,
         )
     )
-    _get_lightop_attention().top_k_per_row_prefill(
-        logits,
-        row_starts_i32,
-        row_ends_i32,
-        topk_out,
-        num_rows,
-        logits.stride(0),
-        logits.stride(1),
-        topk_tokens,
+    # The plugin kernel validates the fast histogram result before publishing
+    # it and performs a same-launch exact fallback if a rank was left empty.
+    torch.ops.hcu_ops.sparse_mla_topk_prefill(
+        logits, row_starts_i32, row_ends_i32, topk_out
     )
     if topk_out is not topk_indices:
         topk_indices.copy_(topk_out)
@@ -1125,17 +1120,39 @@ def _lightop_topk_indices_decode(
     topk_indices: torch.Tensor,
     topk_tokens: int,
 ) -> None:
-    row_ends = _decode_row_ends_from_seq_lens(seq_lens, next_n, logits.shape[0])
-    _get_lightop_attention().top_k_per_row_decode(
-        logits,
-        1,
-        row_ends.to(device=logits.device, dtype=torch.int32),
-        topk_indices,
-        logits.shape[0],
-        logits.stride(0),
-        logits.stride(1),
-        topk_tokens,
+    # Native top-k writes a packed [num_rows, topk_tokens] array: its
+    # interface has logits strides, but no output stride. A view into the
+    # shared index buffer need not have that layout.
+    if logits.dim() != 2 or topk_indices.dim() != 2:
+        raise ValueError("Decode top-k expects 2D logits and output")
+    num_rows, num_columns = logits.shape
+    if topk_indices.shape != (num_rows, topk_tokens):
+        raise ValueError("Decode top-k output shape must match logits rows and top-k")
+    if logits.dtype != torch.float32 or topk_indices.dtype != torch.int32:
+        raise ValueError("Decode top-k requires float32 logits and int32 output")
+    if logits.device != topk_indices.device:
+        raise ValueError("Decode top-k logits and output must be on the same device")
+    if next_n <= 0 or topk_tokens <= 0:
+        raise ValueError("Decode top-k requires positive next_n and top-k")
+
+    row_ends = _decode_row_ends_from_seq_lens(seq_lens, next_n, num_rows)
+    if row_ends.numel() != num_rows:
+        raise ValueError("Decode top-k requires one effective sequence length per row")
+    # Speculative metadata can include inactive/padded rows. Never allow a
+    # native row scan to extend beyond the physical logits allocation.
+    row_ends = row_ends.to(device=logits.device, dtype=torch.int32)
+    row_ends = row_ends.clamp(0, num_columns).contiguous()
+    logits = logits.contiguous()
+    topk_out = (
+        topk_indices
+        if topk_indices.is_contiguous()
+        else torch.empty(
+            (num_rows, topk_tokens), dtype=torch.int32, device=logits.device
+        )
     )
+    torch.ops.hcu_ops.sparse_mla_topk_decode(logits, row_ends, topk_out)
+    if topk_out is not topk_indices:
+        topk_indices.copy_(topk_out)
 
 
 def rocm_aiter_sparse_attn_indexer_fake(

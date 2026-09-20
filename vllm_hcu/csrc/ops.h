@@ -56,3 +56,11 @@ void concat_and_cache_mla_hcu(torch::Tensor& kv_c, torch::Tensor& k_pe,
 void deepseek_v4_inv_rope(torch::Tensor& rope,
                           torch::Tensor const& position_ids,
                           torch::Tensor const& cos_sin_cache);
+
+void sparse_mla_topk_prefill(torch::Tensor const& logits,
+                             torch::Tensor const& row_starts,
+                             torch::Tensor const& row_ends,
+                             torch::Tensor& indices);
+void sparse_mla_topk_decode(torch::Tensor const& logits,
+                            torch::Tensor const& row_ends,
+                            torch::Tensor& indices);

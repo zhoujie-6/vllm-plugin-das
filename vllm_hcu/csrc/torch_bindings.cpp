@@ -59,6 +59,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "deepseek_v4_inv_rope(Tensor! rope, Tensor position_ids, "
       "Tensor cos_sin_cache) -> ()");
   ops.impl("deepseek_v4_inv_rope", torch::kCUDA, &deepseek_v4_inv_rope);
+  ops.def(
+      "sparse_mla_topk_prefill(Tensor logits, Tensor row_starts, "
+      "Tensor row_ends, Tensor! indices) -> ()");
+  ops.impl("sparse_mla_topk_prefill", torch::kCUDA,
+           &sparse_mla_topk_prefill);
+  ops.def(
+      "sparse_mla_topk_decode(Tensor logits, Tensor row_ends, "
+      "Tensor! indices) -> ()");
+  ops.impl("sparse_mla_topk_decode", torch::kCUDA,
+           &sparse_mla_topk_decode);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

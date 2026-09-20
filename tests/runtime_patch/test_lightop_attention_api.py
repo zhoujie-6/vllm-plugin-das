@@ -317,6 +317,18 @@ def test_sparse_mla_topk_helpers_use_categorized_attention_kernels(
     runtime = _runtime()
     prefill_calls: list[tuple[object, ...]] = []
     decode_calls: list[tuple[object, ...]] = []
+    prefill_op_calls: list[tuple[object, ...]] = []
+    decode_op_calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        runtime.torch.ops.hcu_ops,
+        "sparse_mla_topk_prefill",
+        lambda *args: prefill_op_calls.append(args),
+    )
+    monkeypatch.setattr(
+        runtime.torch.ops.hcu_ops,
+        "sparse_mla_topk_decode",
+        lambda *args: decode_op_calls.append(args),
+    )
     monkeypatch.setattr(
         runtime,
         "lightop_attention",
@@ -345,5 +357,7 @@ def test_sparse_mla_topk_helpers_use_categorized_attention_kernels(
         2,
     )
 
-    assert len(prefill_calls) == 1
-    assert len(decode_calls) == 1
+    assert len(prefill_calls) == 0
+    assert len(prefill_op_calls) == 1
+    assert len(decode_calls) == 0
+    assert len(decode_op_calls) == 1
