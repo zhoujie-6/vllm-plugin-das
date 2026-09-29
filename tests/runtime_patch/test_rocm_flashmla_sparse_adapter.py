@@ -70,7 +70,7 @@ def _build_module(ratio, batch, calls, local_heads=4):
         compress_ratio = ratio
         topk_indices_buffer = torch.zeros(batch, 64, dtype=torch.int32)
         swa_cache_layer = SimpleNamespace(kv_cache=torch.zeros(2, 64, 584, dtype=torch.uint8))
-        attn_sink = torch.zeros(4, dtype=torch.float32)
+        attn_sink = torch.arange(local_heads, dtype=torch.float32)
         scale = 0.125
         def _forward_decode(self, q, kv_cache, swa_metadata, attn_metadata, swa_only, output):
             calls.append("aiter")
@@ -291,13 +291,21 @@ def test_decode_contract(monkeypatch, ratio, batch):
 
 
 @pytest.mark.parametrize(
-    ("heads", "uses_flashmla"),
-    [(16, True), (32, False), (64, True), (128, True)],
+    ("heads", "head_padding", "kernel_heads", "uses_flashmla"),
+    [
+        (16, False, 16, True),
+        (32, False, None, False),
+        (32, True, 64, True),
+        (64, False, 64, True),
+        (128, False, 128, True),
+        (129, True, None, False),
+    ],
 )
-def test_decode_falls_back_for_unsupported_local_head_counts(
-    monkeypatch, heads, uses_flashmla
+def test_decode_pads_local_head_counts(
+    monkeypatch, heads, head_padding, kernel_heads, uses_flashmla
 ):
     calls = []
+    kernel_args = {}
     mapper = ModuleType("vllm.models.deepseek_v4.common.ops")
     mapper.compute_global_topk_indices_and_lens = lambda *args: (None, None)
     monkeypatch.setitem(sys.modules, mapper.__name__, mapper)
@@ -307,11 +315,20 @@ def test_decode_falls_back_for_unsupported_local_head_counts(
 
     def kernel(**kwargs):
         calls.append("flashmla_decode")
-        return torch.ones_like(kwargs["q"]), None
+        kernel_args.update(kwargs)
+        values = torch.arange(
+            kwargs["q"].shape[2], dtype=kwargs["q"].dtype
+        ).view(1, 1, -1, 1)
+        return values.expand_as(kwargs["q"]), None
 
     flash.flash_mla_with_kvcache = kernel
     monkeypatch.setitem(sys.modules, flash.__name__, flash)
     monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE", True)
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE_HEAD_PADDING",
+        head_padding,
+    )
     monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL", False)
     monkeypatch.setattr(patch, "_require_flashmla_ready", lambda: calls.append("guard"))
 
@@ -332,28 +349,45 @@ def test_decode_falls_back_for_unsupported_local_head_counts(
     mla_builder.build(0, None)
     tiles = swa_builder.build_tile_scheduler(1)
     metadata = _swa_metadata(1, tiles)
-    q = torch.zeros(1, heads, 512, dtype=torch.bfloat16)
-    Attention()._forward_decode(q, None, metadata, None, True, q.clone())
+    q = torch.arange(heads, dtype=torch.bfloat16).view(1, heads, 1)
+    q = q.expand(1, heads, 512).clone()
+    output = torch.zeros_like(q)
+    attention = Attention()
+    attention._forward_decode(q, None, metadata, None, True, output)
 
     assert ("flashmla_decode" in calls) is uses_flashmla
     assert ("guard" in calls) is uses_flashmla
     assert ("aiter" in calls) is not uses_flashmla
     assert ("dense_swa" in calls) is uses_flashmla
     assert ("ragged_swa" in calls) is not uses_flashmla
+    if uses_flashmla:
+        assert kernel_args["q"].shape == (1, 1, kernel_heads, 512)
+        assert kernel_args["attn_sink"].shape == (kernel_heads,)
+        torch.testing.assert_close(kernel_args["q"][:, :, :heads], q.unsqueeze(1))
+        torch.testing.assert_close(
+            kernel_args["attn_sink"][:heads], attention.attn_sink
+        )
+        if kernel_heads > heads:
+            assert torch.count_nonzero(kernel_args["q"][:, :, heads:]) == 0
+            assert torch.all(torch.isneginf(kernel_args["attn_sink"][heads:]))
+        expected = torch.arange(heads, dtype=output.dtype).view(1, heads, 1)
+        torch.testing.assert_close(output, expected.expand_as(output))
 
 
 @pytest.mark.parametrize(
-    ("heads", "kernel_heads", "uses_flashmla"),
+    ("heads", "head_padding", "kernel_heads", "uses_flashmla"),
     [
-        (16, 64, True),
-        (32, 64, True),
-        (64, 64, True),
-        (128, 128, True),
-        (129, None, False),
+        (16, False, None, False),
+        (16, True, 64, True),
+        (32, False, None, False),
+        (32, True, 64, True),
+        (64, False, 64, True),
+        (128, False, 128, True),
+        (129, True, None, False),
     ],
 )
 def test_prefill_pads_local_head_counts(
-    monkeypatch, heads, kernel_heads, uses_flashmla
+    monkeypatch, heads, head_padding, kernel_heads, uses_flashmla
 ):
     calls = []
     kernel_args = {}
@@ -372,6 +406,11 @@ def test_prefill_pads_local_head_counts(
     monkeypatch.setitem(sys.modules, flash.__name__, flash)
     monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE", False)
     monkeypatch.setattr(henvs, "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL", True)
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL_HEAD_PADDING",
+        head_padding,
+    )
     monkeypatch.setattr(
         patch, "_require_flashmla_prefill_ready", lambda: calls.append("prefill_guard")
     )

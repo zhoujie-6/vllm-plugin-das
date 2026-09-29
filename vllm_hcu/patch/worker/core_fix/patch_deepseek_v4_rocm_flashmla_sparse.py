@@ -23,8 +23,14 @@ _DECODE_MARKER = "_vllm_hcu_flashmla_sparse_decode_applied"
 _PREFILL_MARKER = "_vllm_hcu_flashmla_sparse_prefill_applied"
 
 
-def _flashmla_prefill_padded_heads(num_heads: int) -> int | None:
+def _flashmla_prefill_padded_heads(
+    num_heads: int, *, allow_padding: bool
+) -> int | None:
     """Return the sparse-prefill kernel width for a TP-local Q layout."""
+    if num_heads in (64, 128):
+        return num_heads
+    if not allow_padding:
+        return None
     if 0 < num_heads <= 64:
         return 64
     if num_heads <= 128:
@@ -32,15 +38,36 @@ def _flashmla_prefill_padded_heads(num_heads: int) -> int | None:
     return None
 
 
-def _flashmla_decode_supports_heads(num_heads: int) -> bool:
-    return num_heads <= 16 or num_heads in (64, 128)
+def _flashmla_decode_padded_heads(
+    num_heads: int, *, allow_padding: bool
+) -> int | None:
+    """Return the sparse-decode kernel width for a TP-local Q layout."""
+    if 0 < num_heads <= 16:
+        return num_heads
+    if num_heads in (64, 128):
+        return num_heads
+    if not allow_padding:
+        return None
+    if num_heads <= 64:
+        return 64
+    if num_heads <= 128:
+        return 128
+    return None
 
 
 def _builder_uses_flashmla_decode(builder) -> bool:
+    from vllm_hcu.platforms import envs as henvs
+
     config = builder.vllm_config
     num_heads = config.model_config.hf_config.num_attention_heads
     tp_size = config.parallel_config.tensor_parallel_size
-    return _flashmla_decode_supports_heads(num_heads // tp_size)
+    return (
+        _flashmla_decode_padded_heads(
+            num_heads // tp_size,
+            allow_padding=henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE_HEAD_PADDING,
+        )
+        is not None
+    )
 
 
 @functools.cache
@@ -239,7 +266,15 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
             return original_decode(
                 self, q, kv_cache, swa_metadata, attn_metadata, swa_only, output
             )
-        if q.ndim == 3 and not _flashmla_decode_supports_heads(q.shape[1]):
+        padded_heads = (
+            _flashmla_decode_padded_heads(
+                q.shape[1],
+                allow_padding=henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE_HEAD_PADDING,
+            )
+            if q.ndim == 3
+            else None
+        )
+        if q.ndim == 3 and padded_heads is None:
             return original_decode(
                 self, q, kv_cache, swa_metadata, attn_metadata, swa_only, output
             )
@@ -253,6 +288,19 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
         num_tokens = swa_metadata.num_decode_tokens
         if q.ndim != 3 or q.shape[0] != num_tokens or q.shape[-1] != 512 or output.shape != q.shape:
             raise ValueError("FlashMLA decode requires one 512-wide output per query")
+        if self.attn_sink.ndim != 1 or self.attn_sink.shape[0] != q.shape[1]:
+            raise ValueError("FlashMLA decode requires one attention sink per query head")
+        actual_heads = q.shape[1]
+        assert padded_heads is not None
+        kernel_q = q
+        kernel_sink = self.attn_sink
+        if actual_heads != padded_heads:
+            kernel_q = q.new_zeros((q.shape[0], padded_heads, q.shape[2]))
+            kernel_q[:, :actual_heads].copy_(q)
+            # Match HYV4's FP8 decode padding: a -inf sink is a no-op for the
+            # padded lanes, which are discarded after the kernel returns.
+            kernel_sink = self.attn_sink.new_full((padded_heads,), float("-inf"))
+            kernel_sink[:actual_heads].copy_(self.attn_sink)
         if (
             self.swa_cache_layer.kv_cache.dtype != torch.uint8
             or self.swa_cache_layer.kv_cache.shape[-1] != 584
@@ -311,7 +359,7 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
         swa_cache = self.swa_cache_layer.kv_cache.unsqueeze(-2)
         extra_cache = kv_cache.unsqueeze(-2) if kv_cache is not None else None
         out, _ = flash_mla_with_kvcache(
-            q=q.unsqueeze(1),
+            q=kernel_q.unsqueeze(1),
             k_cache=swa_cache,
             block_table=None,
             cache_seqlens=None,
@@ -321,14 +369,15 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
             indices=swa_indices,
             topk_length=swa_lens,
             softmax_scale=self.scale,
-            attn_sink=self.attn_sink,
+            attn_sink=kernel_sink,
             extra_k_cache=extra_cache,
             extra_indices_in_kvcache=topk_indices,
             extra_topk_length=topk_lens,
         )
-        if out.squeeze(1).shape != output.shape:
+        kernel_output = out.squeeze(1)
+        if kernel_output.shape != (num_tokens, padded_heads, 512):
             raise RuntimeError("FlashMLA returned an unexpected output shape")
-        output.copy_(out.squeeze(1).to(output.dtype))
+        output.copy_(kernel_output[:, :actual_heads].to(output.dtype))
 
     for fn in (
         forward_decode,
@@ -388,7 +437,12 @@ def _apply_prefill_to_module(module: ModuleType) -> bool:
         # FlashMLA backends used by HYV4 and SGLang. Wider layouts retain the
         # original AITER path.
         padded_heads = (
-            _flashmla_prefill_padded_heads(q.shape[1]) if q.ndim == 3 else None
+            _flashmla_prefill_padded_heads(
+                q.shape[1],
+                allow_padding=henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL_HEAD_PADDING,
+            )
+            if q.ndim == 3
+            else None
         )
         if q.ndim == 3 and padded_heads is None:
             return original(
