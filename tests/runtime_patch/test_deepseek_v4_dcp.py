@@ -570,3 +570,76 @@ def test_flashmla_lse_calibration_distinguishes_bases_and_rejects_bad_statistics
     assert not module.lse_is_natural(torch.full((2, 8), 2.0))
     with pytest.raises(RuntimeError, match="LSE calibration failed"):
         module.lse_is_natural(torch.zeros(2, 8))
+
+
+@pytest.mark.parametrize("world_size", [1, 2])
+@pytest.mark.parametrize("drafts,parallel", [(0, False), (5, False), (5, True)])
+def test_speculative_dcp_mla_split_matches_swa(world_size, drafts, parallel):
+    source = Path(__file__).parents[2] / (
+        "vllm_hcu/patch/worker/core_fix/patch_deepseek_v4_rocm_flashmla_sparse.py"
+    )
+    helper = next(n for n in ast.parse(source.read_text()).body
+                  if isinstance(n, ast.FunctionDef)
+                  and n.name == "_initialize_dcp_decode_threshold")
+    namespace = {}
+    exec(compile(ast.Module(body=[helper], type_ignores=[]), str(source), "exec"), namespace)
+    # Exercise the real generic initializer: its DCP reset caused the crash.
+    base = Path("/usr/local/lib/python3.10/dist-packages/vllm/v1/attention/backend.py")
+    init = next(n for n in ast.walk(ast.parse(base.read_text()))
+                if isinstance(n, ast.FunctionDef) and n.name == "_init_reorder_batch_threshold")
+    exec(compile(ast.Module(body=[init], type_ignores=[]), str(base), "exec"), namespace)
+    spec = SimpleNamespace(num_speculative_tokens=drafts, parallel_drafting=parallel)
+    builder = SimpleNamespace(vllm_config=SimpleNamespace(
+        speculative_config=spec,
+        parallel_config=SimpleNamespace(decode_context_parallel_size=world_size),
+    ))
+    builder._init_reorder_batch_threshold = functools.partial(
+        namespace["_init_reorder_batch_threshold"], builder,
+    )
+    builder._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+    namespace["_initialize_dcp_decode_threshold"](builder)
+    assert builder.reorder_batch_threshold == 1 + drafts * (2 if parallel else 1)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_v2_dcp_slot_mappings_replicate_state_and_shard_compressed_cache(rank):
+    source = Path(__file__).parents[2] / "vllm_hcu/v1/deepseek_v4_dcp_block_tables.py"
+    cls = next(n for n in ast.parse(source.read_text()).body if isinstance(n, ast.ClassDef))
+    calls = []
+
+    class Kernel:
+        def __getitem__(self, grid):
+            def run(max_tokens, idx, starts, positions, tables, strides, sizes,
+                    slots, slot_stride, cp_rank, **kw):
+                assert grid == (1, 2)
+                cp_size = kw["CP_SIZE"]
+                calls.append(cp_size)
+                size = int(sizes[0])
+                for token, pos in enumerate(positions.tolist()):
+                    block = int(tables[0][0, pos // (size * cp_size)])
+                    local = pos // cp_size % size
+                    slots[0, token] = (
+                        block * size + local if pos % cp_size == cp_rank else -1
+                    )
+                slots[0, len(positions):].fill_(-1)
+            return run
+
+    namespace = dict(BlockTables=object, _compute_slot_mappings_kernel=Kernel(), PAD_SLOT_ID=-1)
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), str(source), "exec"), namespace)
+    tables = object.__new__(namespace["DeepseekV4DCPBlockTables"])
+    tables.replicated_groups = (0,)
+    tables.num_kv_cache_groups = 2
+    tables.max_num_batched_tokens = 20
+    tables.cp_size, tables.cp_rank, tables.cp_interleave = 2, rank, 1
+    tables.block_table_ptrs = [torch.tensor([[10, 11, 12, 13]]), torch.tensor([[20, 21]])]
+    tables.block_table_strides = [4, 2]
+    tables.block_sizes_tensor = torch.tensor([4, 4])
+    tables.slot_mappings = torch.zeros(2, 20, dtype=torch.int64)
+    result = tables.compute_slot_mappings(
+        torch.tensor([0]), torch.tensor([0, 16]), torch.arange(16), 18,
+    )
+    assert calls == [1, 2]
+    assert result[0].tolist() == list(range(40, 56)) + [-1, -1]
+    assert result[1].tolist() == [
+        80 + pos // 2 if pos % 2 == rank else -1 for pos in range(16)
+    ] + [-1, -1]

@@ -133,6 +133,24 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 "HCU PCP requires exactly one KV cache group."
             )
         super().initialize_kv_cache(kv_cache_config)
+        if (
+            self.dcp_size > 1
+            and self.model_config.hf_config.model_type == "deepseek_v4"
+        ):
+            from vllm_hcu.v1.deepseek_v4_dcp_block_tables import (
+                DeepseekV4DCPBlockTables, replicated_group_ids,
+            )
+
+            groups = replicated_group_ids(self.kv_cache_config)
+            if groups:
+                self.block_tables = DeepseekV4DCPBlockTables(self.block_tables, groups)
+                # DSpark's draft speculator also retains the target block tables.
+                from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+
+                if isinstance(self.speculator, DraftModelSpeculator):
+                    self.speculator.set_attn(
+                        self.model_state, self.kv_cache_config, self.block_tables,
+                    )
         if pcp_size > 1:
             self.pcp_manager = maybe_build_pcp_manager(
                 self.vllm_config,

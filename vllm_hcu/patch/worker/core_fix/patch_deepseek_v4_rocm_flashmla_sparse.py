@@ -50,6 +50,18 @@ def _builder_uses_flashmla_decode(builder) -> bool:
     return _flashmla_decode_supports_heads(num_heads // tp_size)
 
 
+def _initialize_dcp_decode_threshold(builder) -> None:
+    """Keep compressed MLA and SWA on the same speculative decode split.
+
+    The upstream generic initializer resets the threshold to one under DCP.
+    Our sparse kernels use per-token indices and support variable query lengths.
+    """
+    if builder.vllm_config.parallel_config.decode_context_parallel_size > 1:
+        builder._init_reorder_batch_threshold(
+            1, supports_spec_as_decode=True, supports_dcp_with_varlen=True,
+        )
+
+
 @functools.cache
 def _require_flashmla_ready() -> None:
     """Fail loudly, once, if the FlashMLA sparse decode path cannot run here.
@@ -218,6 +230,7 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
     @functools.wraps(original_mla_init)
     def mla_builder_init(self, *args, **kwargs):
         original_mla_init(self, *args, **kwargs)
+        _initialize_dcp_decode_threshold(self)
         from vllm_hcu.platforms import envs as henvs
 
         if (
