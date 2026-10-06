@@ -8,12 +8,10 @@ from __future__ import annotations
 import torch
 import math
 
-from vllm.platforms import current_platform
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.worker.workspace import current_workspace_manager
-import vllm_hcu.platforms.envs as henvs
 from vllm_hcu.v1.attention.ops.deepseek_v4_ops.cache_utils import (
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
@@ -23,7 +21,7 @@ from vllm_hcu.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
     flash_mla_with_kvcache,
 )
-from vllm_hcu.v1.attention.ops.deepseek_v4_ops.debug import check_dcp_tensor
+from vllm_hcu.v1.attention.ops.deepseek_v4_ops.dcp import check_dcp_tensor
 
 PREFILL_CHUNK_SIZE = 4
 
@@ -49,6 +47,42 @@ def _localize_c4_indices(indices, world_size, rank):
     return torch.gather(local, -1, order)
 
 
+def _prepare_dcp_attention(owner, out, lse, has_keys, stage):
+    """Release padded kernel outputs before allocating collective buffers."""
+    if lse is None:
+        raise RuntimeError(f"DeepSeek-V4 DCP {stage} kernel did not return LSE")
+    # Decode returns [tokens, heads, 1]; prefill returns [tokens, heads].
+    if lse.dim() == 3:
+        lse = lse.squeeze(-1)
+    lse = lse[:, :out.shape[1]]
+    if not getattr(owner, f"dcp_{stage}_lse_base_e", True):
+        lse = lse * math.log(2)
+    return _mask_empty_attention(out, lse, has_keys)
+
+
+def _reduce_dcp_attention(owner, out, lse, stage):
+    """Merge sparse shards and include the replicated sink exactly once."""
+    check_dcp_tensor(owner, f"{stage}.local_output", out)
+    check_dcp_tensor(owner, f"{stage}.local_lse", lse, True)
+    combine = dcp_a2a_lse_reduce if owner.dcp_a2a else cp_lse_ag_out_rs
+    out, lse = combine(
+        out, lse, owner.dcp_group, return_lse=True, is_lse_base_on_e=True,
+    )
+    check_dcp_tensor(owner, f"{stage}.merged_output", out)
+    check_dcp_tensor(owner, f"{stage}.merged_lse", lse, True)
+    if owner.attn_sink is not None:
+        sink = owner.attn_sink.reshape(-1)[:out.shape[1]].to(lse.dtype)
+        sink_lse = torch.logaddexp(lse, sink.unsqueeze(0))
+        weight = torch.exp(lse - sink_lse).to(out.dtype).unsqueeze(-1)
+        # Preserve prefill's in-place update: long contexts already keep
+        # the gathered queries and all-to-all buffers live here.
+        if stage == "prefill":
+            out.mul_(weight)
+        else:
+            out = out * weight
+    return out
+
+
 class DeepseekV4DCPAttention:
     def _forward_decode(
         self,
@@ -59,6 +93,7 @@ class DeepseekV4DCPAttention:
         swa_only: bool,
         output: torch.Tensor,
     ) -> None:
+        assert self.dcp_group is not None
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
         check_dcp_tensor(self, "decode.query", q)
@@ -89,25 +124,22 @@ class DeepseekV4DCPAttention:
                 # C128A: pre-computed during metadata build.
                 topk_indices = attn_metadata.c128a_global_decode_topk_indices
                 topk_lens = attn_metadata.c128a_decode_topk_lens
-                if self.dcp_group is not None:
-                    # C128A attends all compressed positions. Its upstream
-                    # metadata uses global lengths and unsharded block offsets.
-                    local_lens = get_dcp_local_seq_lens(
-                        topk_lens, self.dcp_world_size,
-                        self.dcp_group.rank_in_group, 1,
-                    )
-                    offsets = torch.arange(
-                        topk_indices.shape[-1], device=q.device, dtype=torch.int32
-                    )
-                    local_indices = torch.where(
-                        offsets[None, :] < local_lens[:, None],
-                        offsets[None, :], -1,
-                    )
-                    global_indices, topk_lens = compute_global_topk_indices_and_lens(
-                        local_indices, swa_metadata.token_to_req_indices,
-                        attn_metadata.block_table[:num_decodes], block_size, is_valid,
-                    )
-                    topk_indices = global_indices[:, None, :]
+                local_lens = get_dcp_local_seq_lens(
+                    topk_lens, self.dcp_world_size,
+                    self.dcp_group.rank_in_group, 1,
+                )
+                offsets = torch.arange(
+                    topk_indices.shape[-1], device=q.device, dtype=torch.int32
+                )
+                local_indices = torch.where(
+                    offsets[None, :] < local_lens[:, None],
+                    offsets[None, :], -1,
+                )
+                global_indices, topk_lens = compute_global_topk_indices_and_lens(
+                    local_indices, swa_metadata.token_to_req_indices,
+                    attn_metadata.block_table[:num_decodes], block_size, is_valid,
+                )
+                topk_indices = global_indices[:, None, :]
 
         swa_indices = swa_metadata.decode_swa_indices
         swa_lens = swa_metadata.decode_swa_lens
@@ -117,41 +149,13 @@ class DeepseekV4DCPAttention:
         # otherwise every DCP rank contributes the same SWA keys and changes
         # their weight relative to the sharded compressed cache and sink.
         # Rank 0 owns the replicated term for the reduction.
-        if self.dcp_group is not None and self.dcp_group.rank_in_group != 0:
+        if self.dcp_group.rank_in_group != 0:
             swa_lens = torch.zeros_like(swa_lens)
-
-        if (
-            current_platform.is_rocm()
-            and henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK
-            and self.dcp_world_size == 1
-        ):
-            from vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse import (
-                rocm_forward_decode_fallback,
-            )
-
-            rocm_forward_decode_fallback(
-                q=q,
-                kv_cache=kv_cache,
-                swa_k_cache=self.swa_cache_layer.kv_cache,
-                swa_only=swa_only,
-                topk_indices=topk_indices,
-                topk_lens=topk_lens,
-                swa_indices=swa_indices,
-                swa_lens=swa_lens,
-                attn_sink=self.attn_sink,
-                scale=self.scale,
-                head_dim=self.head_dim,
-                nope_head_dim=self.nope_head_dim,
-                rope_head_dim=self.rope_head_dim,
-                output=output,
-            )
-            return
 
         # We treat queries in the same seq as different queries
         # and later we only attend by generated indices.
         # q arrives pre-padded to self.padded_heads by the outer wrapper.
-        if self.dcp_group is not None:
-            q = self.dcp_group.all_gather(q, dim=1)
+        q = self.dcp_group.all_gather(q, dim=1)
         actual_heads = q.shape[1]
         if 16 < actual_heads < 64:
             q = torch.nn.functional.pad(q, (0, 0, 0, 64 - actual_heads))
@@ -188,11 +192,6 @@ class DeepseekV4DCPAttention:
             "allocate one for this layer type."
         )
 
-        flashmla_attn_sink = (
-            self.attn_sink.reshape(-1)[: q.shape[2]]
-            if self.attn_sink is not None
-            else None
-        )
         out, lse = flash_mla_with_kvcache(
             q=q,
             k_cache=swa_cache,
@@ -206,43 +205,18 @@ class DeepseekV4DCPAttention:
             softmax_scale=self.scale,
             # The sink is a global softmax participant and must be applied
             # once, after rank-local LSE/output reduction.
-            attn_sink=(None if self.dcp_group is not None else flashmla_attn_sink),
+            attn_sink=None,
             extra_k_cache=kv_cache if not swa_only else None,
             extra_indices_in_kvcache=topk_indices,
             extra_topk_length=topk_lens,
             # out=output.unsqueeze(1),
         )
         out = out.squeeze(1)[:, :actual_heads]
-        if self.dcp_group is not None:
-            if lse is None:
-                raise RuntimeError("DeepSeek-V4 DCP decode kernel did not return LSE")
-            # FlashMLA decode returns [tokens, heads, query_len=1].
-            lse = lse.squeeze(-1) if lse.dim() == 3 else lse
-            lse = lse[:, :actual_heads]
-            if not getattr(self, "dcp_decode_lse_base_e", True):
-                lse = lse * math.log(2)
-            has_keys = swa_lens > 0
-            if topk_lens is not None:
-                has_keys = has_keys | (topk_lens > 0)
-            out, lse = _mask_empty_attention(out, lse, has_keys)
-            check_dcp_tensor(self, "decode.local_output", out)
-            check_dcp_tensor(self, "decode.local_lse", lse, True)
-            dcp_combine = (
-                dcp_a2a_lse_reduce if self.dcp_a2a else cp_lse_ag_out_rs
-            )
-            out, lse = dcp_combine(
-                out,
-                lse,
-                self.dcp_group,
-                return_lse=True,
-                is_lse_base_on_e=True,
-            )
-            check_dcp_tensor(self, "decode.merged_output", out)
-            check_dcp_tensor(self, "decode.merged_lse", lse, True)
-            if flashmla_attn_sink is not None:
-                sink = flashmla_attn_sink[: out.shape[1]].to(lse.dtype)
-                merged_lse = torch.logaddexp(lse, sink.unsqueeze(0))
-                out = out * torch.exp(lse - merged_lse).to(out.dtype).unsqueeze(-1)
+        has_keys = swa_lens > 0
+        if topk_lens is not None:
+            has_keys = has_keys | (topk_lens > 0)
+        out, lse = _prepare_dcp_attention(self, out, lse, has_keys, "decode")
+        out = _reduce_dcp_attention(self, out, lse, "decode")
         output.copy_(out.to(output.dtype))
         check_dcp_tensor(self, "decode.sink_output", output)
 
@@ -256,6 +230,7 @@ class DeepseekV4DCPAttention:
         attn_metadata: FlashMLASparseMetadata | None,
         swa_metadata: "DeepseekSparseSWAMetadata",
     ) -> None:
+        assert self.dcp_group is not None
         swa_only = attn_metadata is None
         check_dcp_tensor(self, "prefill.query", q)
 
@@ -269,7 +244,7 @@ class DeepseekV4DCPAttention:
         gather_lens = swa_metadata.prefill_gather_lens
         assert seq_lens is not None
         assert gather_lens is not None
-        if self.dcp_group is not None and self.dcp_group.rank_in_group != 0:
+        if self.dcp_group.rank_in_group != 0:
             gather_lens = torch.zeros_like(gather_lens)
 
         # Derive prefill-local token offsets from the full query_start_loc_cpu.
@@ -291,11 +266,10 @@ class DeepseekV4DCPAttention:
                 # C128A: pre-computed during metadata build.
                 assert attn_metadata is not None
                 topk_indices = attn_metadata.c128a_prefill_topk_indices
-                if self.dcp_group is not None:
-                    topk_indices = _localize_c128a_prefill_indices(
-                        topk_indices, self.dcp_world_size,
-                        self.dcp_group.rank_in_group,
-                    )
+                topk_indices = _localize_c128a_prefill_indices(
+                    topk_indices, self.dcp_world_size,
+                    self.dcp_group.rank_in_group,
+                )
             top_k = topk_indices.shape[-1]
             # Compressed region must fit the full compressed pool (seq_len //
             # compress_ratio), not just top_k. top_k bounds how many indices
@@ -330,13 +304,12 @@ class DeepseekV4DCPAttention:
                 compressed_seq_lens = (
                     seq_lens[chunk_start:chunk_end] // self.compress_ratio
                 )
-                if self.dcp_group is not None:
-                    compressed_seq_lens = get_dcp_local_seq_lens(
-                        compressed_seq_lens,
-                        self.dcp_world_size,
-                        self.dcp_group.rank_in_group,
-                        1,
-                    )
+                compressed_seq_lens = get_dcp_local_seq_lens(
+                    compressed_seq_lens,
+                    self.dcp_world_size,
+                    self.dcp_group.rank_in_group,
+                    1,
+                )
                 dequantize_and_gather_k_cache(
                     kv[:chunk_size],
                     compressed_k_cache,
@@ -381,77 +354,29 @@ class DeepseekV4DCPAttention:
                 N,
             )
 
-            if current_platform.is_rocm():
-                check_dcp_tensor(self, "prefill.gathered_kv", kv[:chunk_size])
-                q_chunk = q[query_start:query_end]
-                if self.dcp_group is not None:
-                    q_chunk = self.dcp_group.all_gather(q_chunk, dim=1)
-                actual_heads = q_chunk.shape[1]
-                kernel_sink = None if self.dcp_group is not None else self.attn_sink
-                if actual_heads < 64:
-                    # FlashMLA sparse prefill instantiates 64/128-head kernels.
-                    q_chunk = torch.nn.functional.pad(
-                        q_chunk, (0, 0, 0, 64 - actual_heads)
-                    )
-                    if kernel_sink is not None:
-                        kernel_sink = torch.nn.functional.pad(
-                            kernel_sink, (0, 64 - actual_heads), value=-float("inf")
-                        )
-                output_chunk, _, local_lse = flash_mla_sparse_fwd(
-                    q=q_chunk,
-                    kv=kv.view(-1, 1, q.shape[-1]),
-                    indices=combined_indices.unsqueeze(1),
-                    sm_scale=self.scale,
-                    attn_sink=kernel_sink,
-                    topk_length=combined_lens,
+            check_dcp_tensor(self, "prefill.gathered_kv", kv[:chunk_size])
+            q_chunk = q[query_start:query_end]
+            q_chunk = self.dcp_group.all_gather(q_chunk, dim=1)
+            actual_heads = q_chunk.shape[1]
+            if actual_heads < 64:
+                # FlashMLA sparse prefill instantiates 64/128-head kernels.
+                q_chunk = torch.nn.functional.pad(
+                    q_chunk, (0, 0, 0, 64 - actual_heads)
                 )
-                output_chunk = output_chunk[:, :actual_heads]
-                local_lse = local_lse[:, :actual_heads] if local_lse is not None else None
-                if local_lse is not None and not getattr(self, "dcp_prefill_lse_base_e", True):
-                    local_lse = local_lse * math.log(2)
-                if self.dcp_group is not None:
-                    if local_lse is None:
-                        raise RuntimeError(
-                            "DeepSeek-V4 DCP prefill kernel did not return LSE"
-                        )
-                    output_chunk, local_lse = _mask_empty_attention(
-                        output_chunk, local_lse,
-                        (combined_indices >= 0).any(dim=-1),
-                    )
-                    check_dcp_tensor(self, "prefill.local_output", output_chunk)
-                    check_dcp_tensor(self, "prefill.local_lse", local_lse, True)
-                    dcp_combine = (
-                        dcp_a2a_lse_reduce
-                        if self.dcp_a2a
-                        else cp_lse_ag_out_rs
-                    )
-                    output_chunk, merged_lse = dcp_combine(
-                        output_chunk,
-                        local_lse,
-                        self.dcp_group,
-                        return_lse=True,
-                        is_lse_base_on_e=True,
-                    )
-                    check_dcp_tensor(self, "prefill.merged_output", output_chunk)
-                    check_dcp_tensor(self, "prefill.merged_lse", merged_lse, True)
-                    sink = self.attn_sink[: output_chunk.shape[1]].to(
-                        merged_lse.dtype
-                    )
-                    sink_lse = torch.logaddexp(
-                        merged_lse, sink.unsqueeze(0)
-                    )
-                    output_chunk *= torch.exp(
-                        merged_lse - sink_lse
-                    ).to(output_chunk.dtype).unsqueeze(-1)
-                output[query_start:query_end].copy_(output_chunk.to(output.dtype))
-                check_dcp_tensor(self, "prefill.sink_output", output[query_start:query_end])
-            else:
-                output_chunk, _, _ = flash_mla_sparse_fwd(
-                    q=q[query_start:query_end],
-                    kv=kv.view(-1, 1, q.shape[-1]),
-                    indices=combined_indices.unsqueeze(1),
-                    sm_scale=self.scale,
-                    attn_sink=self.attn_sink,
-                    topk_length=combined_lens,
-                    out=output[query_start:query_end],
-                )
+            output_chunk, _, local_lse = flash_mla_sparse_fwd(
+                q=q_chunk,
+                kv=kv.view(-1, 1, q.shape[-1]),
+                indices=combined_indices.unsqueeze(1),
+                sm_scale=self.scale,
+                attn_sink=None,
+                topk_length=combined_lens,
+            )
+            output_chunk = output_chunk[:, :actual_heads]
+            local_lse = local_lse[:, :actual_heads] if local_lse is not None else None
+            output_chunk, local_lse = _prepare_dcp_attention(
+                self, output_chunk, local_lse,
+                (combined_indices >= 0).any(dim=-1), "prefill",
+            )
+            output_chunk = _reduce_dcp_attention(self, output_chunk, local_lse, "prefill")
+            output[query_start:query_end].copy_(output_chunk.to(output.dtype))
+            check_dcp_tensor(self, "prefill.sink_output", output[query_start:query_end])

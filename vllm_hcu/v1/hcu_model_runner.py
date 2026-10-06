@@ -5101,7 +5101,7 @@ class GPUModelRunner(
                             vllm_config=self.vllm_config,
                             model_config=self.model_config,
                         )
-                from vllm_hcu.v1.deepseek_v4_dcp_audit import audit_deepseek_v4_dcp
+                from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_dcp_compressor import audit_deepseek_v4_dcp
 
                 audit_deepseek_v4_dcp(self.model, self.vllm_config)
                 if self.lora_config:

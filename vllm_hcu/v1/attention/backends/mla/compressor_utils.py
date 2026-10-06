@@ -5,7 +5,7 @@
 import torch
 
 from vllm.triton_utils import tl, triton
-from vllm_hcu.v1.cp_layout import cp_global_to_local_block
+from vllm_hcu.v1.attention.ops.deepseek_v4_ops.dcp import cp_global_to_local_block
 
 
 @triton.jit

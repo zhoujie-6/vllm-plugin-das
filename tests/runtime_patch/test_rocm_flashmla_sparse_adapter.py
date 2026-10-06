@@ -19,7 +19,10 @@ def _build_module(ratio, batch, calls, local_heads=4):
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(num_attention_heads=local_heads)
         ),
-        parallel_config=SimpleNamespace(tensor_parallel_size=1),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1, decode_context_parallel_size=1,
+            dcp_comm_backend="ag_rs",
+        ),
     )
 
     class BaseBuilder:
@@ -67,13 +70,24 @@ def _build_module(ratio, batch, calls, local_heads=4):
             return SimpleNamespace(dense_mla=True)
 
     class Attention:
+        config = vllm_config
         compress_ratio = ratio
         topk_indices_buffer = torch.zeros(batch, 64, dtype=torch.int32)
         swa_cache_layer = SimpleNamespace(kv_cache=torch.zeros(2, 64, 584, dtype=torch.uint8))
         attn_sink = torch.zeros(4, dtype=torch.float32)
         scale = 0.125
+
+        def __init__(self, vllm_config):
+            self.n_local_heads = local_heads
+
         def _forward_decode(self, q, kv_cache, swa_metadata, attn_metadata, swa_only, output):
             calls.append("aiter")
+
+        def _forward_prefill(
+            self, q, positions, compressed_k_cache, swa_k_cache,
+            output, attn_metadata, swa_metadata,
+        ):
+            calls.append("aiter_prefill")
 
     module = ModuleType(patch.TARGET_MODULE)
     module.DeepseekV4ROCMAiterMLAAttention = Attention
@@ -230,7 +244,7 @@ def test_decode_contract(monkeypatch, ratio, batch):
     )
     q = torch.zeros(batch, 4, 512, dtype=torch.bfloat16)
     output = torch.zeros(batch, 4, 512, dtype=torch.bfloat16)
-    Attention()._forward_decode(
+    Attention(vllm_config=Attention.config)._forward_decode(
         q, None if ratio == 1 else torch.zeros(2, 64, 584, dtype=torch.uint8),
         metadata, None if ratio == 1 else compressed, ratio == 1, output,
     )
@@ -273,7 +287,7 @@ def test_decode_contract(monkeypatch, ratio, batch):
     disabled_builder.build(0, None)
     MLABuilder().build(0, None)
     assert "ragged_swa" in calls and "ragged_mla" in calls
-    Attention()._forward_decode(q, None, metadata, None, True, output)
+    Attention(vllm_config=Attention.config)._forward_decode(q, None, metadata, None, True, output)
     assert calls[-1] == "aiter"
     module.rocm_sparse_attn_prefill(
         prefill_q,
@@ -333,7 +347,7 @@ def test_decode_falls_back_for_unsupported_local_head_counts(
     tiles = swa_builder.build_tile_scheduler(1)
     metadata = _swa_metadata(1, tiles)
     q = torch.zeros(1, heads, 512, dtype=torch.bfloat16)
-    Attention()._forward_decode(q, None, metadata, None, True, q.clone())
+    Attention(vllm_config=Attention.config)._forward_decode(q, None, metadata, None, True, q.clone())
 
     assert ("flashmla_decode" in calls) is uses_flashmla
     assert ("guard" in calls) is uses_flashmla

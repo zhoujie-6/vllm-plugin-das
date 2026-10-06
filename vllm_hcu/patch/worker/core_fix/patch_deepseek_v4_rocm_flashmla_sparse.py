@@ -25,15 +25,15 @@ _FLASHMLA_PREFILL_HEAD_COUNTS = (64, 128)
 
 
 def _initialize_dcp_state(attention, vllm_config) -> None:
-    from vllm.distributed import get_dcp_group
-
     parallel = vllm_config.parallel_config
     attention.dcp_world_size = parallel.decode_context_parallel_size
-    attention.dcp_group = get_dcp_group() if attention.dcp_world_size > 1 else None
+    attention.dcp_group = None
     attention.dcp_a2a = parallel.dcp_comm_backend == "a2a"
     if attention.dcp_world_size > 1:
-        from vllm_hcu.v1.attention.ops.deepseek_v4_ops.lse import calibrate_flashmla_lse
+        from vllm.distributed import get_dcp_group
+        from vllm_hcu.v1.attention.ops.deepseek_v4_ops.dcp import calibrate_flashmla_lse
 
+        attention.dcp_group = get_dcp_group()
         attention.dcp_prefill_lse_base_e, attention.dcp_decode_lse_base_e = (
             calibrate_flashmla_lse(torch.cuda.current_device())
         )
@@ -304,11 +304,11 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
             )
 
         _require_flashmla_ready()
-        from vllm_hcu.model_executor.layers.deepseek_v4_dcp_attention import (
-            DeepseekV4DCPAttention,
-        )
-
         if self.dcp_world_size > 1:
+            from vllm_hcu.model_executor.layers.deepseek_v4_dcp_attention import (
+                DeepseekV4DCPAttention,
+            )
+
             return DeepseekV4DCPAttention._forward_decode(
                 self, q, kv_cache, swa_metadata, attn_metadata, swa_only, output
             )

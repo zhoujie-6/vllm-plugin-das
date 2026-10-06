@@ -4,6 +4,7 @@ import importlib.util
 import ast
 import functools
 import sys
+import weakref
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -41,9 +42,10 @@ try:
     sys.modules["vllm.distributed"] = vllm_distributed
     sys.modules["vllm.triton_utils"] = vllm_triton
 
-    ContextParallelLayout = _load_source(
-        "_test_hcu_cp_layout", "vllm_hcu/v1/cp_layout.py"
-    ).ContextParallelLayout
+    layout_ops = _load_source(
+        "_test_hcu_cp_layout", "vllm_hcu/v1/attention/ops/deepseek_v4_ops/dcp.py"
+    )
+    ContextParallelLayout = layout_ops.ContextParallelLayout
     dcp_softmax_reduce = _load_source(
         "_test_hcu_dsv4_dcp", "vllm_hcu/v1/attention/ops/deepseek_v4_ops/dcp.py"
     ).dcp_softmax_reduce
@@ -56,18 +58,16 @@ finally:
 
 
 def test_context_parallel_layout_interleaved_ownership_and_lengths():
-    layouts = [ContextParallelLayout(2, rank, 2) for rank in range(2)]
     positions = torch.arange(12)
-    assert layouts[0].owns(positions).tolist() == [
-        True, True, False, False, True, True, False, False, True, True, False, False
-    ]
-    assert layouts[1].owns(positions).logical_not().equal(layouts[0].owns(positions))
-    assert layouts[0].global_to_local(torch.tensor([0, 1, 2, 3, 4, 8])).tolist() == [
-        0, 1, 2, 2, 2, 4
-    ]
-    assert layouts[1].global_to_local(torch.tensor([0, 1, 2, 3, 4, 8])).tolist() == [
-        0, 0, 0, 1, 2, 4
-    ]
+    for rank in range(2):
+        layout = ContextParallelLayout(2, rank, 2)
+        blocks, offsets, owned = layout_ops.cp_global_to_local_block(
+            positions, 4, **layout.triton_kwargs(),
+        )
+        assert owned.equal((positions // 2) % 2 == rank)
+        local = blocks * 4 + offsets
+        reconstructed = local // 2 * 4 + rank * 2 + local % 2
+        assert reconstructed[owned].equal(positions[owned])
 
 
 def test_wrapped_sliding_caches_keep_replicated_slot_mappings():
@@ -170,7 +170,7 @@ def test_rocm_dcp_constructor_captures_config_without_forward_context(
 
     distributed.get_dcp_group = get_group
     monkeypatch.setitem(sys.modules, "vllm.distributed", distributed)
-    calibration = ModuleType("vllm_hcu.v1.attention.ops.deepseek_v4_ops.lse")
+    calibration = ModuleType("vllm_hcu.v1.attention.ops.deepseek_v4_ops.dcp")
     calibration.calibrate_flashmla_lse = lambda device: (True, True)
     monkeypatch.setitem(sys.modules, calibration.__name__, calibration)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
@@ -364,16 +364,22 @@ def test_dcp_decode_normalizes_flashmla_lse_and_empty_shard_before_collective(lo
     for arg in fn.args.args:
         arg.annotation = None
 
+    kernel_outputs = []
+
     def flash(**kwargs):
         q = kwargs["q"]
         assert q.shape[2] == (64 if local_heads == 16 else 4)
         assert kwargs["attn_sink"] is None
         assert kwargs["topk_length"].eq(0).all()
-        return torch.full_like(q, float("nan")), torch.full(
+        out = torch.full_like(q, float("nan"))
+        kernel_outputs.append(weakref.ref(out))
+        return out, torch.full(
             (q.shape[0], q.shape[2], 1), float("nan")
         )
 
     def combine(out, lse, group, **kwargs):
+        # The original padded output must die before collective buffers grow.
+        assert kernel_outputs[-1]() is None
         assert out.shape == (2, local_heads * 2, 512)
         assert lse.shape == (2, local_heads * 2)
         assert out.eq(0).all()
@@ -390,7 +396,11 @@ def test_dcp_decode_normalizes_flashmla_lse_and_empty_shard_before_collective(lo
         "_mask_empty_attention": _load_dcp_function("_mask_empty_attention"),
         "check_dcp_tensor": lambda *args: None,
     }
-    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(source), "exec"), namespace)
+    reducer = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                   and n.name == "_reduce_dcp_attention")
+    prepare = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                   and n.name == "_prepare_dcp_attention")
+    exec(compile(ast.Module(body=[prepare, reducer, fn], type_ignores=[]), str(source), "exec"), namespace)
     attention = SimpleNamespace(
         compress_ratio=1, dcp_world_size=2, dcp_a2a=True,
         dcp_group=SimpleNamespace(rank_in_group=1,
@@ -420,7 +430,7 @@ def test_native_compressor_patch_routes_both_cache_writers(monkeypatch, world_si
                         "vllm_hcu/patch/worker/core_fix/patch_deepseek_v4_dcp_compressor.py")
     calls = []
     group = object()
-    layout_module = ModuleType("vllm_hcu.v1.cp_layout")
+    layout_module = ModuleType("vllm_hcu.v1.attention.ops.deepseek_v4_ops.dcp")
     layout_module.ContextParallelLayout = SimpleNamespace(
         from_config=lambda config: SimpleNamespace(
             enabled=world_size > 1, interleave_size=1, world_size=world_size, rank=0
@@ -536,7 +546,12 @@ def test_compressor_partial_stats_read_replicated_ring_slots(padding):
 
 @pytest.mark.parametrize("patched,world_size", [(False, 2), (True, 1), (True, 2)])
 def test_loaded_model_audit_rejects_missing_or_misconfigured_dcp(patched, world_size):
-    audit = _load_source("_test_dcp_model_audit", "vllm_hcu/v1/deepseek_v4_dcp_audit.py")
+    source = Path(__file__).parents[2] / "vllm_hcu/patch/worker/core_fix/patch_deepseek_v4_dcp_compressor.py"
+    fn = next(n for n in ast.parse(source.read_text()).body
+              if isinstance(n, ast.FunctionDef) and n.name == "audit_deepseek_v4_dcp")
+    namespace = {"os": __import__("os")}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(source), "exec"), namespace)
+    audit = SimpleNamespace(audit_deepseek_v4_dcp=namespace["audit_deepseek_v4_dcp"])
 
     class Attention:
         dcp_world_size = world_size
@@ -565,7 +580,13 @@ def test_loaded_model_audit_rejects_missing_or_misconfigured_dcp(patched, world_
 
 
 def test_flashmla_lse_calibration_distinguishes_bases_and_rejects_bad_statistics():
-    module = _load_source("_test_lse_convention", "vllm_hcu/v1/attention/ops/deepseek_v4_ops/lse.py")
+    # Load just the convention checker; runtime dependencies are irrelevant.
+    source = Path(__file__).parents[2] / "vllm_hcu/v1/attention/ops/deepseek_v4_ops/dcp.py"
+    fn = next(n for n in ast.parse(source.read_text()).body
+              if isinstance(n, ast.FunctionDef) and n.name == "lse_is_natural")
+    namespace = {"torch": torch, "math": __import__("math")}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(source), "exec"), namespace)
+    module = SimpleNamespace(lse_is_natural=namespace["lse_is_natural"])
     assert module.lse_is_natural(torch.full((2, 8), torch.log(torch.tensor(4.0))))
     assert not module.lse_is_natural(torch.full((2, 8), 2.0))
     with pytest.raises(RuntimeError, match="LSE calibration failed"):
@@ -643,3 +664,48 @@ def test_v2_dcp_slot_mappings_replicate_state_and_shard_compressed_cache(rank):
     assert result[1].tolist() == [
         80 + pos // 2 if pos % 2 == rank else -1 for pos in range(16)
     ] + [-1, -1]
+
+
+@pytest.mark.parametrize("stage", ["decode", "prefill"])
+@pytest.mark.parametrize("natural_lse", [False, True])
+@pytest.mark.parametrize("a2a", [False, True])
+def test_shared_dcp_reduce_preserves_lse_empty_shards_and_single_sink(stage, natural_lse, a2a):
+    source = Path(__file__).parents[2] / "vllm_hcu/model_executor/layers/deepseek_v4_dcp_attention.py"
+    fn = next(n for n in ast.parse(source.read_text()).body
+              if isinstance(n, ast.FunctionDef) and n.name == "_reduce_dcp_attention")
+    math = __import__("math")
+    out = torch.full((2, 4, 3), 2.0)
+    out[0] = float("nan")
+    lse = torch.full((2, 4), math.log(4) if natural_lse else 2.0)
+    lse[0] = float("nan")
+    if stage == "decode":
+        lse = lse.unsqueeze(-1)
+    calls = []
+
+    def combine(local_out, local_lse, group, **kwargs):
+        assert kwargs == {"return_lse": True, "is_lse_base_on_e": True}
+        assert local_out[0].eq(0).all() and local_lse[0].isneginf().all()
+        torch.testing.assert_close(local_lse[1], torch.full((4,), math.log(4)))
+        calls.append(group)
+        return torch.full((2, 2, 3), 2.0), torch.full((2, 2), math.log(4))
+
+    def wrong_backend(*args, **kwargs):
+        pytest.fail("The configured DCP communication backend was not used")
+
+    owner = SimpleNamespace(dcp_a2a=a2a, dcp_group=object(), attn_sink=torch.zeros(2))
+    setattr(owner, f"dcp_{stage}_lse_base_e", natural_lse)
+    namespace = {
+        "torch": torch, "math": math,
+        "_mask_empty_attention": _load_dcp_function("_mask_empty_attention"),
+        "check_dcp_tensor": lambda *args: None,
+        "dcp_a2a_lse_reduce": combine if a2a else wrong_backend,
+        "cp_lse_ag_out_rs": wrong_backend if a2a else combine,
+    }
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(source), "exec"), namespace)
+    prepare = next(n for n in ast.parse(source.read_text()).body
+                   if isinstance(n, ast.FunctionDef) and n.name == "_prepare_dcp_attention")
+    exec(compile(ast.Module(body=[prepare], type_ignores=[]), str(source), "exec"), namespace)
+    out, lse = namespace[prepare.name](owner, out, lse, torch.tensor([False, True]), stage)
+    result = namespace[fn.name](owner, out, lse, stage)
+    assert calls == [owner.dcp_group]
+    torch.testing.assert_close(result, torch.full((2, 2, 3), 1.6))
