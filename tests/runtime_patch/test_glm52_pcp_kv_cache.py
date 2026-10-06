@@ -75,6 +75,7 @@ def _vllm_config(
             prefill_context_parallel_size=pcp,
         ),
         model_config=SimpleNamespace(max_model_len=max_model_len),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=32),
         kv_transfer_config=None,
     )
 
@@ -167,6 +168,24 @@ def test_full_attention_memory_capacity_is_not_divided_by_pcp(
     assert spec.max_memory_usage_bytes(config) == expected_blocks * 512
 
 
+def test_sliding_window_memory_is_replicated_under_dcp(patched_cache_modules):
+    spec = patched_cache_modules.interface.SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float16,
+        sliding_window=64,
+    )
+    config = _vllm_config(
+        block_size=16,
+        dcp=2,
+        pcp=1,
+        max_model_len=128,
+    )
+
+    assert spec.max_memory_usage_bytes(config) == 7 * 512
+
+
 @pytest.mark.parametrize(
     ("dcp", "pcp", "expected_block_size"),
     [(1, 1, 16), (1, 2, 16), (2, 1, 32)],
@@ -188,6 +207,22 @@ def test_single_type_manager_allocation_granularity_is_dcp_only(
     assert manager.block_size == expected_block_size
     assert manager.dcp_world_size == dcp
     assert manager.pcp_world_size == pcp
+
+
+def test_replicated_sliding_cache_scheduler_allocates_every_page(patched_cache_modules):
+    interface = patched_cache_modules.interface
+    spec = interface.SlidingWindowMLASpec(
+        block_size=256, num_kv_heads=1, head_size=512,
+        dtype=torch.bfloat16, sliding_window=128,
+    )
+    manager = patched_cache_modules.manager.SlidingWindowManager(
+        kv_cache_spec=spec, block_pool=SimpleNamespace(null_block=object()),
+        enable_caching=False, kv_cache_group_id=0, scheduler_block_size=256,
+        dcp_world_size=2, pcp_world_size=1,
+    )
+    assert manager.block_size == 256
+    assert manager.dcp_world_size == 1
+    assert manager.get_num_blocks_to_allocate("new", 257, [], 0, 257) == 2
 
 
 @pytest.mark.parametrize(
@@ -371,7 +406,12 @@ def test_cache_adapters_fail_closed_on_signature_drift():
         def max_memory_usage_bytes(self, config, extra):
             del self, config, extra
 
+    class SlidingWindowSpec:
+        def max_memory_usage_bytes(self, vllm_config):
+            del self, vllm_config
+
     interface.FullAttentionSpec = FullAttentionSpec
+    interface.SlidingWindowSpec = SlidingWindowSpec
     with pytest.raises(PatchCompatibilityError, match="incompatible signature"):
         patch_pcp_kv_cache_interface.apply_to_module(interface)
 
@@ -388,6 +428,7 @@ def test_cache_adapters_fail_closed_on_signature_drift():
 
     managers.SingleTypeKVCacheManager = SingleTypeKVCacheManager
     managers.FullAttentionManager = FullAttentionManager
+    managers.SlidingWindowSpec = type("SlidingWindowSpec", (), {})
     with pytest.raises(PatchCompatibilityError, match="incompatible signature"):
         patch_pcp_single_type_kv_cache_manager.apply_to_module(managers)
 
@@ -449,12 +490,24 @@ def test_pcp1_cache_adapters_delegate_to_original_implementations():
             )
             return 13
 
+    class SlidingWindowSpec:
+        def max_memory_usage_bytes(self, vllm_config):
+            calls.append(
+                (
+                    "sliding_memory",
+                    vllm_config.parallel_config.prefill_context_parallel_size,
+                )
+            )
+            return 17
+
     interface.FullAttentionSpec = FullAttentionSpec
+    interface.SlidingWindowSpec = SlidingWindowSpec
     interface.cdiv = lambda numerator, denominator: (
         numerator + denominator - 1
     ) // denominator
     assert patch_pcp_kv_cache_interface.apply_to_module(interface) is True
     assert FullAttentionSpec().max_memory_usage_bytes(config) == 13
+    assert SlidingWindowSpec().max_memory_usage_bytes(config) == 17
 
     managers = ModuleType(patch_pcp_single_type_kv_cache_manager.TARGET_MODULE)
 
@@ -511,6 +564,7 @@ def test_pcp1_cache_adapters_delegate_to_original_implementations():
 
     managers.SingleTypeKVCacheManager = SingleTypeKVCacheManager
     managers.FullAttentionManager = FullAttentionManager
+    managers.SlidingWindowSpec = type("SlidingWindowSpec", (), {})
     assert patch_pcp_single_type_kv_cache_manager.apply_to_module(managers) is True
     FullAttentionManager(None, None, False, 0, 16, pcp_world_size=1)
     assert FullAttentionManager.find_longest_cache_hit(
@@ -560,6 +614,7 @@ def test_pcp1_cache_adapters_delegate_to_original_implementations():
     assert calls == [
         ("resolve", 1),
         ("memory", 1),
+        ("sliding_memory", 1),
         ("manager", 1),
         ("hash", 1),
         ("coordinator", 1),

@@ -5101,6 +5101,9 @@ class GPUModelRunner(
                             vllm_config=self.vllm_config,
                             model_config=self.model_config,
                         )
+                from vllm_hcu.v1.deepseek_v4_dcp_audit import audit_deepseek_v4_dcp
+
+                audit_deepseek_v4_dcp(self.model, self.vllm_config)
                 if self.lora_config:
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
@@ -6932,8 +6935,15 @@ class GPUModelRunner(
         """
         block_sizes = []
         max_num_blocks = []
+        dcp_world_sizes = []
         groups_without_slot_mapping = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
+        dcp_world_size = int(
+            self.vllm_config.parallel_config.decode_context_parallel_size
+        )
+        pcp_world_size = int(
+            self.vllm_config.parallel_config.prefill_context_parallel_size
+        )
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
                 continue
@@ -6949,8 +6959,26 @@ class GPUModelRunner(
             ):
                 groups_without_slot_mapping.append(len(block_sizes))
             block_sizes.append(block_size)
+            # Sliding-window caches (DeepSeek-V4 SWA and compressor state
+            # rings) are replicated across DCP ranks. Full/compressed MLA
+            # caches are DCP sharded. Newer vLLM exposes this choice as the
+            # spec's dcp_sharded field; preserve the v0.25.1 behavior here.
+            dcp_sharded = bool(
+                getattr(
+                    kv_cache_group.kv_cache_spec,
+                    "dcp_sharded",
+                    get_kv_cache_spec_kind(kv_cache_group.kv_cache_spec)
+                    not in (
+                        KVCacheSpecKind.SLIDING_WINDOW,
+                        KVCacheSpecKind.SLIDING_WINDOW_MLA,
+                    ),
+                )
+            )
+            group_dcp_world_size = dcp_world_size if dcp_sharded else 1
+            dcp_world_sizes.append(group_dcp_world_size)
             max_num_blocks_per_req = cdiv(
-                max_model_len, block_size * get_total_cp_world_size()
+                max_model_len,
+                block_size * pcp_world_size * group_dcp_world_size,
             )
             if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
                 max_num_blocks_per_req = (
@@ -6983,6 +7011,18 @@ class GPUModelRunner(
             )
             set_slot_mapping_groups_without_slots(
                 self.input_batch.block_table, groups_without_slot_mapping
+            )
+
+        # vLLM 0.25.1's MultiGroupBlockTable reads the process-wide DCP group
+        # for every cache group. Override it with the per-group geometry used
+        # to size the tables above. Without this, replicated SWA/compressor
+        # caches receive sharded slot mappings and decode reads stale states.
+        for block_table, group_dcp_world_size in zip(
+            self.input_batch.block_table.block_tables, dcp_world_sizes
+        ):
+            block_table.dcp_world_size = group_dcp_world_size
+            block_table.dcp_rank = (
+                get_dcp_group().rank_in_group if group_dcp_world_size > 1 else 0
             )
 
         assert self._init_block_sizes == block_sizes, (

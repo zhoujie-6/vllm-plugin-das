@@ -86,6 +86,9 @@ def apply_to_module(module: ModuleType) -> bool:
         "FullAttentionManager",
         f"{TARGET_MODULE}.FullAttentionManager",
     )
+    sliding_window_spec = require_class(
+        managers, "SlidingWindowSpec", f"{TARGET_MODULE}.SlidingWindowSpec"
+    )
 
     hash_descriptor = vars(full_attention_manager).get("find_longest_cache_hit")
     if not isinstance(hash_descriptor, classmethod):
@@ -145,6 +148,11 @@ def apply_to_module(module: ModuleType) -> bool:
         pcp_world_size=1,
         max_admission_blocks_per_request=None,
     ):
+        # SWA and compressor-state rings store every position on every rank.
+        # The scheduler must allocate the same unsharded block geometry as
+        # the worker's slot mapping, including sequences crossing a page.
+        if isinstance(kv_cache_spec, sliding_window_spec):
+            dcp_world_size = 1
         if pcp_world_size == 1:
             return original_init(
                 self,

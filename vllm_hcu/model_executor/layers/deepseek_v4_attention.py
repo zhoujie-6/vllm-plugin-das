@@ -51,7 +51,7 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_dcp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
@@ -71,6 +71,8 @@ from vllm_hcu.utils.multi_stream_utils import (
     maybe_execute_in_parallel,
 )
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
+from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     DeepseekV4FlashMLASparseBackend,
     FlashMLASparseBackend,
@@ -81,6 +83,7 @@ from vllm.v1.attention.backends.mla.indexer import (
     get_max_prefill_buffer_size,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm_hcu.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
     flash_mla_with_kvcache,
@@ -759,6 +762,13 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             vllm_config.scheduler_config.max_num_batched_tokens
         )
         self.max_model_len = vllm_config.model_config.max_model_len
+        self.dcp_world_size = (
+            vllm_config.parallel_config.decode_context_parallel_size
+        )
+        self.dcp_group = get_dcp_group() if self.dcp_world_size > 1 else None
+        self.dcp_a2a = (
+            vllm_config.parallel_config.dcp_comm_backend == "a2a"
+        )
         # DeepseekV4 only supports fp8 kv-cache format for now.
         kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "fp8"
 
@@ -878,116 +888,13 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_only: bool,
         output: torch.Tensor,
     ) -> None:
-        num_decodes = swa_metadata.num_decodes
-        num_decode_tokens = swa_metadata.num_decode_tokens
-
-        topk_indices = None
-        topk_lens = None
-        if not swa_only:
-            assert attn_metadata is not None
-            assert swa_metadata.is_valid_token is not None
-            block_size = attn_metadata.block_size // self.compress_ratio
-            is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
-            if self.compress_ratio == 4:
-                # C4A: local indices differ per layer (filled by Indexer).
-                assert self.topk_indices_buffer is not None
-                global_indices, topk_lens = compute_global_topk_indices_and_lens(
-                    self.topk_indices_buffer[:num_decode_tokens],
-                    swa_metadata.token_to_req_indices,
-                    attn_metadata.block_table[:num_decodes],
-                    block_size,
-                    is_valid,
-                )
-                topk_indices = global_indices.view(num_decode_tokens, 1, -1)
-            else:
-                # C128A: pre-computed during metadata build.
-                topk_indices = attn_metadata.c128a_global_decode_topk_indices
-                topk_lens = attn_metadata.c128a_decode_topk_lens
-
-        swa_indices = swa_metadata.decode_swa_indices
-        swa_lens = swa_metadata.decode_swa_lens
-
-        if (
-            current_platform.is_rocm()
-            and henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK
-        ):
-            rocm_forward_decode_fallback(
-                q=q,
-                kv_cache=kv_cache,
-                swa_k_cache=self.swa_cache_layer.kv_cache,
-                swa_only=swa_only,
-                topk_indices=topk_indices,
-                topk_lens=topk_lens,
-                swa_indices=swa_indices,
-                swa_lens=swa_lens,
-                attn_sink=self.attn_sink,
-                scale=self.scale,
-                head_dim=self.head_dim,
-                nope_head_dim=self.nope_head_dim,
-                rope_head_dim=self.rope_head_dim,
-                output=output,
-            )
-            return
-
-        # We treat queries in the same seq as different queries
-        # and later we only attend by generated indices.
-        # q arrives pre-padded to self.padded_heads by the outer wrapper.
-        q = q.unsqueeze(1)
-
-        # Prepare SWA cache (num_blocks, swa_block_size, 1, head_bytes)
-        # Use unsqueeze to preserve strides (handles padded blocks correctly)
-        swa_cache = self.swa_cache_layer.kv_cache.unsqueeze(-2)
-        # Reshape KV cache to (num_blocks, block_size, 1, head_bytes)
-        if kv_cache is not None:
-            kv_cache = kv_cache.unsqueeze(-2)
-
-        # One FlashMLASchedMeta per layer type, shared across all same-type
-        # layers within this decode step. The first forward call per type
-        # triggers the in-kernel planner (allocating tile_scheduler_metadata
-        # and num_splits via PyTorch's graph-aware allocator so CUDA graph
-        # capture reuses the same addresses on replay); subsequent same-type
-        # layers see have_initialized=True and skip the planner.
-        if self.compress_ratio <= 1:
-            tile_metadata = swa_metadata.tile_sched_swaonly
-        elif self.compress_ratio == 4:
-            tile_metadata = swa_metadata.tile_sched_c4a
-        elif self.compress_ratio == 128:
-            tile_metadata = swa_metadata.tile_sched_c128a
-        else:
-            raise ValueError(
-                f"Unsupported compress_ratio={self.compress_ratio}; "
-                "expected 1, 4, or 128."
-            )
-        assert tile_metadata is not None, (
-            "swa_metadata missing tile_sched entry for "
-            f"compress_ratio={self.compress_ratio}; "
-            "DeepseekSparseSWAMetadataBuilder.build_tile_scheduler did not "
-            "allocate one for this layer type."
+        from vllm_hcu.model_executor.layers.deepseek_v4_dcp_attention import (
+            DeepseekV4DCPAttention,
         )
 
-        flashmla_attn_sink = (
-            self.attn_sink.reshape(-1)[: q.shape[2]]
-            if self.attn_sink is not None
-            else None
+        return DeepseekV4DCPAttention._forward_decode(
+            self, q, kv_cache, swa_metadata, attn_metadata, swa_only, output
         )
-        out, _ = flash_mla_with_kvcache(
-            q=q,
-            k_cache=swa_cache,
-            block_table=None,
-            head_dim_v=512,
-            tile_scheduler_metadata=tile_metadata,
-            cache_seqlens=None,
-            is_fp8_kvcache=True,
-            indices=swa_indices,
-            topk_length=swa_lens,
-            softmax_scale=self.scale,
-            attn_sink=flashmla_attn_sink,
-            extra_k_cache=kv_cache if not swa_only else None,
-            extra_indices_in_kvcache=topk_indices,
-            extra_topk_length=topk_lens,
-            # out=output.unsqueeze(1),
-        )
-        output.copy_(out.squeeze(1).to(output.dtype))
 
     def _forward_prefill(
         self,
@@ -999,126 +906,14 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         attn_metadata: FlashMLASparseMetadata | None,
         swa_metadata: "DeepseekSparseSWAMetadata",
     ) -> None:
-        swa_only = attn_metadata is None
+        from vllm_hcu.model_executor.layers.deepseek_v4_dcp_attention import (
+            DeepseekV4DCPAttention,
+        )
 
-        num_prefills = swa_metadata.num_prefills
-        num_prefill_tokens = swa_metadata.num_prefill_tokens
-        num_decodes = swa_metadata.num_decodes
-        num_decode_tokens = swa_metadata.num_decode_tokens
-
-        # Use pre-computed prefill metadata.
-        seq_lens = swa_metadata.prefill_seq_lens
-        gather_lens = swa_metadata.prefill_gather_lens
-        assert seq_lens is not None
-        assert gather_lens is not None
-
-        # Derive prefill-local token offsets from the full query_start_loc_cpu.
-        query_start_loc_cpu = swa_metadata.query_start_loc_cpu
-        query_start_loc = swa_metadata.query_start_loc
-        assert query_start_loc_cpu is not None
-        assert query_start_loc is not None
-        prefill_token_base = query_start_loc_cpu[num_decodes]
-
-        if not swa_only:
-            if self.compress_ratio == 4:
-                assert self.topk_indices_buffer is not None
-                topk_indices = self.topk_indices_buffer[num_decode_tokens:]
-                topk_indices = topk_indices[:num_prefill_tokens]
-            else:
-                # C128A: pre-computed during metadata build.
-                assert attn_metadata is not None
-                topk_indices = attn_metadata.c128a_prefill_topk_indices
-            top_k = topk_indices.shape[-1]
-            # Compressed region must fit the full compressed pool (seq_len //
-            # compress_ratio), not just top_k. top_k bounds how many indices
-            # the indexer selects, not the pool size it indexes into.
-            N = (self.max_model_len + self.compress_ratio - 1) // self.compress_ratio
-        else:
-            # NOTE(woosuk): topk_indices will not be used for SWA-only layers.
-            assert self.topk_indices_buffer is not None
-            topk_indices = self.topk_indices_buffer[num_decode_tokens:]
-            top_k = 0
-            N = 0
-
-        M = N + self.window_size + self.max_num_batched_tokens
-        num_chunks = (num_prefills + PREFILL_CHUNK_SIZE - 1) // PREFILL_CHUNK_SIZE
-
-        workspace_manager = current_workspace_manager()
-        kv = workspace_manager.get_simultaneous(
-            ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
-        )[0]
-        for chunk_idx in range(num_chunks):
-            chunk_start = chunk_idx * PREFILL_CHUNK_SIZE
-            chunk_end = min(chunk_start + PREFILL_CHUNK_SIZE, num_prefills)
-            chunk_size = chunk_end - chunk_start
-            if not swa_only:
-                # Gather compressed KV
-                assert attn_metadata is not None
-                block_table = attn_metadata.block_table[num_decodes:]
-                dequantize_and_gather_k_cache(
-                    kv[:chunk_size],
-                    compressed_k_cache,
-                    seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
-                    gather_lens=None,
-                    block_table=block_table[chunk_start:chunk_end],
-                    block_size=attn_metadata.block_size // self.compress_ratio,
-                    offset=0,
-                )
-
-            # Gather SWA KV
-            swa_block_table = swa_metadata.block_table[num_decodes:]
-            dequantize_and_gather_k_cache(
-                kv[:chunk_size],
-                swa_k_cache,
-                seq_lens=seq_lens[chunk_start:chunk_end],
-                gather_lens=gather_lens[chunk_start:chunk_end],
-                block_table=swa_block_table[chunk_start:chunk_end],
-                block_size=swa_metadata.block_size,
-                offset=N,
-            )
-
-            # Combine the topk indices and SWA indices for gathered KV cache
-            query_start = (
-                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
-            )
-            query_end = (
-                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
-            )
-
-            combined_indices, combined_lens = combine_topk_swa_indices(
-                topk_indices[query_start:query_end],
-                query_start_loc[
-                    num_decodes + chunk_start : num_decodes + chunk_end + 1
-                ],
-                seq_lens[chunk_start:chunk_end],
-                gather_lens[chunk_start:chunk_end],
-                self.window_size,
-                self.compress_ratio,
-                top_k,
-                M,
-                N,
-            )
-
-            if current_platform.is_rocm():
-                output_chunk, _, _ = flash_mla_sparse_fwd(
-                    q=q[query_start:query_end],
-                    kv=kv.view(-1, 1, q.shape[-1]),
-                    indices=combined_indices.unsqueeze(1),
-                    sm_scale=self.scale,
-                    attn_sink=self.attn_sink,
-                    topk_length=combined_lens,
-                )
-                output[query_start:query_end].copy_(output_chunk.to(output.dtype))
-            else:
-                output_chunk, _, _ = flash_mla_sparse_fwd(
-                    q=q[query_start:query_end],
-                    kv=kv.view(-1, 1, q.shape[-1]),
-                    indices=combined_indices.unsqueeze(1),
-                    sm_scale=self.scale,
-                    attn_sink=self.attn_sink,
-                    topk_length=combined_lens,
-                    out=output[query_start:query_end],
-                )
+        return DeepseekV4DCPAttention._forward_prefill(
+            self, q, positions, compressed_k_cache, swa_k_cache,
+            output, attn_metadata, swa_metadata
+        )
 
 
 class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):

@@ -67,11 +67,11 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_resolve_kv_cache_block_sizes(kv_cache_config, vllm_config):
         parallel_config = vllm_config.parallel_config
         pcp = parallel_config.prefill_context_parallel_size
-        if pcp == 1:
+        dcp = parallel_config.decode_context_parallel_size
+        if pcp == 1 and dcp == 1:
             return original(kv_cache_config, vllm_config)
 
         cache_config = vllm_config.cache_config
-        dcp = parallel_config.decode_context_parallel_size
         groups = kv_cache_config.kv_cache_groups
 
         if len(groups) <= 1:

@@ -24,6 +24,21 @@ _PREFILL_MARKER = "_vllm_hcu_flashmla_sparse_prefill_applied"
 _FLASHMLA_PREFILL_HEAD_COUNTS = (64, 128)
 
 
+def _initialize_dcp_state(attention, vllm_config) -> None:
+    from vllm.distributed import get_dcp_group
+
+    parallel = vllm_config.parallel_config
+    attention.dcp_world_size = parallel.decode_context_parallel_size
+    attention.dcp_group = get_dcp_group() if attention.dcp_world_size > 1 else None
+    attention.dcp_a2a = parallel.dcp_comm_backend == "a2a"
+    if attention.dcp_world_size > 1:
+        from vllm_hcu.v1.attention.ops.deepseek_v4_ops.lse import calibrate_flashmla_lse
+
+        attention.dcp_prefill_lse_base_e, attention.dcp_decode_lse_base_e = (
+            calibrate_flashmla_lse(torch.cuda.current_device())
+        )
+
+
 def _flashmla_decode_supports_heads(num_heads: int) -> bool:
     return num_heads <= 16 or num_heads in (64, 128)
 
@@ -107,6 +122,8 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
         rocm, "DeepseekV4ROCMAiterMLASparseMetadataBuilder", TARGET_MODULE
     )
     original_decode = require_callable(attention_cls, "_forward_decode", TARGET_MODULE)
+    original_attention_init = require_callable(attention_cls, "__init__", TARGET_MODULE)
+    original_prefill = require_callable(attention_cls, "_forward_prefill", TARGET_MODULE)
     original_scheduler = require_callable(builder_cls, "build_tile_scheduler", TARGET_MODULE)
     original_swa_build = require_callable(builder_cls, "build", TARGET_MODULE)
     original_mla_build = require_callable(mla_builder_cls, "build", TARGET_MODULE)
@@ -116,7 +133,9 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
         if not all(
             getattr(fn, _DECODE_MARKER, False)
             for fn in (
+                attention_cls.__init__,
                 attention_cls._forward_decode,
+                attention_cls._forward_prefill,
                 builder_cls.build,
                 builder_cls.build_tile_scheduler,
                 builder_cls.__init__,
@@ -131,6 +150,41 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
         f"{TARGET_MODULE}.DeepseekV4ROCMAiterMLAAttention._forward_decode",
         positional=("self", "q", "kv_cache", "swa_metadata", "attn_metadata", "swa_only", "output"),
     )
+    require_exact_signature(
+        original_prefill,
+        f"{TARGET_MODULE}.DeepseekV4ROCMAiterMLAAttention._forward_prefill",
+        positional=(
+            "self", "q", "positions", "compressed_k_cache", "swa_k_cache",
+            "output", "attn_metadata", "swa_metadata",
+        ),
+    )
+
+    @functools.wraps(original_attention_init)
+    def attention_init(self, *args, **kwargs):
+        # Warmup and graph replay run without a current-config context.
+        # Capture the explicit constructor config while the model is built.
+        vllm_config = args[0] if args else kwargs["vllm_config"]
+        if vllm_config.parallel_config.decode_context_parallel_size > 1:
+            # Also cover model modules imported before callback registration.
+            from .patch_deepseek_v4_dcp_compressor import apply
+
+            apply()
+        original_attention_init(self, *args, **kwargs)
+        _initialize_dcp_state(self, vllm_config)
+        if self.dcp_world_size > 1:
+            from vllm.logger import init_logger
+
+            compressor = getattr(self, "compressor", None)
+            if compressor is not None and not getattr(
+                compressor.forward, "_vllm_hcu_dcp_compressor_applied", False
+            ):
+                raise RuntimeError("Native DeepSeek-V4 compressor DCP patch is not active")
+            init_logger(__name__).info_once(
+                "DeepSeek-V4 DCP runtime: attention=%s heads=%d dcp=%d compressor=%s",
+                type(self).__module__, self.n_local_heads, self.dcp_world_size,
+                type(compressor).__module__ if compressor is not None else "SWA-only",
+            )
+
     require_exact_signature(
         original_scheduler,
         f"{TARGET_MODULE}.DeepseekV4ROCMAiterSparseSWAMetadataBuilder.build_tile_scheduler",
@@ -237,6 +291,16 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
             )
 
         _require_flashmla_ready()
+        from vllm_hcu.model_executor.layers.deepseek_v4_dcp_attention import (
+            DeepseekV4DCPAttention,
+        )
+
+        if self.dcp_world_size > 1:
+            return DeepseekV4DCPAttention._forward_decode(
+                self, q, kv_cache, swa_metadata, attn_metadata, swa_only, output
+            )
+
+        # Preserve the validated v0.25.1 non-DCP implementation.
         from vllm.models.deepseek_v4.common.ops import (
             compute_global_topk_indices_and_lens,
         )
@@ -322,8 +386,52 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
             raise RuntimeError("FlashMLA returned an unexpected output shape")
         output.copy_(out.squeeze(1).to(output.dtype))
 
+    @functools.wraps(original_prefill)
+    def forward_prefill(
+        self,
+        q,
+        positions,
+        compressed_k_cache,
+        swa_k_cache,
+        output,
+        attn_metadata,
+        swa_metadata,
+    ):
+        from vllm_hcu.platforms import envs as henvs
+
+        if (
+            not henvs.VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL
+            or self.dcp_world_size == 1
+        ):
+            return original_prefill(
+                self,
+                q,
+                positions,
+                compressed_k_cache,
+                swa_k_cache,
+                output,
+                attn_metadata,
+                swa_metadata,
+            )
+        from vllm_hcu.model_executor.layers.deepseek_v4_dcp_attention import (
+            DeepseekV4DCPAttention,
+        )
+
+        return DeepseekV4DCPAttention._forward_prefill(
+            self,
+            q,
+            positions,
+            compressed_k_cache,
+            swa_k_cache,
+            output,
+            attn_metadata,
+            swa_metadata,
+        )
+
     for fn in (
+        attention_init,
         forward_decode,
+        forward_prefill,
         build_swa_metadata,
         build_mla_metadata,
         build_tile_scheduler,
@@ -332,6 +440,8 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
     ):
         setattr(fn, _DECODE_MARKER, True)
     setattr(attention_cls, "_forward_decode", forward_decode)
+    setattr(attention_cls, "__init__", attention_init)
+    setattr(attention_cls, "_forward_prefill", forward_prefill)
     setattr(builder_cls, "build_tile_scheduler", build_tile_scheduler)
     setattr(builder_cls, "build", build_swa_metadata)
     setattr(builder_cls, "__init__", swa_builder_init)

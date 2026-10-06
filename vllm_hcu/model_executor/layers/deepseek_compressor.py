@@ -19,6 +19,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 import vllm_hcu.platforms.envs as henvs
+from vllm.distributed import get_dcp_group
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -33,7 +34,13 @@ from vllm.v1.attention.ops.deepseek_v4_ops.fused_compress_quant_cache import (
     _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn_window,
     _fused_kv_compress_norm_rope_insert_sparse_attn,
     _fused_kv_compress_norm_rope_insert_sparse_attn_window,
+    dsv4_dcp_compressor_partial_stats_kernel,
+    dsv4_dcp_finalize_indexer_attn_kernel,
+    dsv4_dcp_finalize_indexer_mxfp4_attn_kernel,
+    dsv4_dcp_finalize_sparse_attn_kernel,
 )
+from vllm_hcu.v1.attention.ops.deepseek_v4_ops.dcp import dcp_softmax_reduce
+from vllm_hcu.v1.cp_layout import ContextParallelLayout
 from vllm.v1.attention.ops.deepseek_v4_ops.fused_indexer_q import (
     MXFP4_BLOCK_SIZE,
 )
@@ -223,6 +230,8 @@ class DeepseekCompressor(nn.Module):
         self.device = current_platform.device_type
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.max_model_len = vllm_config.model_config.max_model_len
+        self.cp_layout = ContextParallelLayout.from_config(vllm_config)
+        self.dcp_group = get_dcp_group() if self.cp_layout.enabled else None
 
         self.overlap = compress_ratio == 4
         self.coff = 1 + self.overlap
@@ -339,6 +348,7 @@ class DeepseekCompressor(nn.Module):
         if (
             henvs.VLLM_HCU_USE_CUSTOM_OPS
             and henvs.VLLM_HCU_ENABLE_DEEPSEEK_V4_C128_COMPRESSOR
+            and not self.cp_layout.enabled
             and self.compress_ratio == 128
             and self.head_dim == 512
             and token_to_req_indices is not None
@@ -440,6 +450,24 @@ class DeepseekCompressor(nn.Module):
         cos_sin_cache = rotary_emb.cos_sin_cache
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         kv_cache = self._static_forward_context[self.k_cache_prefix].kv_cache
+
+        if self.cp_layout.enabled:
+            assert self.dcp_group is not None
+            self._dcp_compress_and_insert(
+                state_cache=state_cache,
+                num_actual=num_actual,
+                token_to_req_indices=token_to_req_indices,
+                positions=positions,
+                block_table=block_table,
+                block_size=block_size,
+                state_width=state_width,
+                slot_mapping=slot_mapping,
+                cos_sin_cache=cos_sin_cache,
+                kv_cache=kv_cache,
+                k_cache_metadata=k_cache_metadata,
+                pdl_kwargs=pdl_kwargs,
+            )
+            return
 
         state_block_stride = state_cache.stride(0)
         kv_block_stride = kv_cache.stride(0)
@@ -562,6 +590,138 @@ class DeepseekCompressor(nn.Module):
             num_warps=self._num_warps,
             **pdl_kwargs,
         )
+
+
+    def _dcp_compress_and_insert(
+        self,
+        state_cache: torch.Tensor,
+        num_actual: int,
+        token_to_req_indices: torch.Tensor,
+        positions: torch.Tensor,
+        block_table: torch.Tensor,
+        block_size: int,
+        state_width: int,
+        slot_mapping: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        kv_cache: torch.Tensor,
+        k_cache_metadata: Any,
+        pdl_kwargs: dict,
+    ) -> None:
+        partial_m = torch.empty(
+            (num_actual, self.head_dim),
+            dtype=torch.float32,
+            device=state_cache.device,
+        )
+        partial_s = torch.empty_like(partial_m)
+        partial_v = torch.empty_like(partial_m)
+
+        dsv4_dcp_compressor_partial_stats_kernel[(num_actual,)](
+            state_cache,
+            state_cache.stride(0),
+            state_cache.stride(1),
+            token_to_req_indices,
+            positions,
+            slot_mapping,
+            block_table,
+            block_table.stride(0),
+            block_size,
+            partial_m,
+            partial_s,
+            partial_v,
+            partial_m.stride(0),
+            HEAD_SIZE=self.head_dim,
+            TRITON_BLOCK_SIZE=triton.next_power_of_2(self.head_dim),
+            STATE_WIDTH=state_width,
+            COMPRESS_RATIO=self.compress_ratio,
+            OVERLAP=self.overlap,
+            num_warps=4 if self.head_dim == 512 else 1,
+            **self.cp_layout.triton_kwargs(),
+            **pdl_kwargs,
+        )
+
+        assert self.dcp_group is not None
+        compressed_kv = dcp_softmax_reduce(
+            partial_m,
+            partial_s,
+            partial_v,
+            self.dcp_group,
+        )
+
+        if self.head_dim == 512:
+            dsv4_dcp_finalize_sparse_attn_kernel[(num_actual,)](
+                compressed_kv,
+                compressed_kv.stride(0),
+                token_to_req_indices,
+                positions,
+                slot_mapping,
+                k_cache_metadata.block_table,
+                k_cache_metadata.block_table.stride(0),
+                k_cache_metadata.block_size // self.compress_ratio,
+                self.norm.weight,
+                self.rms_norm_eps,
+                cos_sin_cache,
+                cos_sin_cache.stride(0),
+                kv_cache,
+                HEAD_SIZE=self.head_dim,
+                TRITON_BLOCK_SIZE=triton.next_power_of_2(self.head_dim),
+                COMPRESS_RATIO=self.compress_ratio,
+                ROPE_HEAD_DIM=self.rope_head_dim,
+                FP8_MAX=448.0,
+                QUANT_BLOCK=self._quant_block,
+                TOKEN_STRIDE=self._token_stride,
+                SCALE_DIM=self._scale_dim,
+                KV_BLOCK_STRIDE=kv_cache.stride(0),
+                num_warps=4,
+                **self.cp_layout.triton_kwargs(),
+                **pdl_kwargs,
+            )
+        elif self.use_fp4_cache:
+            dsv4_dcp_finalize_indexer_mxfp4_attn_kernel[(num_actual,)](
+                compressed_kv,
+                compressed_kv.stride(0),
+                positions,
+                k_cache_metadata.slot_mapping,
+                self.norm.weight,
+                self.rms_norm_eps,
+                cos_sin_cache,
+                cos_sin_cache.stride(0),
+                kv_cache,
+                kv_cache.shape[1],
+                HEAD_SIZE=self.head_dim,
+                TRITON_BLOCK_SIZE=triton.next_power_of_2(self.head_dim),
+                COMPRESS_RATIO=self.compress_ratio,
+                ROPE_HEAD_DIM=self.rope_head_dim,
+                QUANT_BLOCK=self._quant_block,
+                TOKEN_STRIDE=self._token_stride,
+                SCALE_DIM=self._scale_dim,
+                KV_BLOCK_STRIDE=kv_cache.stride(0),
+                num_warps=1,
+                **pdl_kwargs,
+            )
+        else:
+            dsv4_dcp_finalize_indexer_attn_kernel[(num_actual,)](
+                compressed_kv,
+                compressed_kv.stride(0),
+                positions,
+                k_cache_metadata.slot_mapping,
+                self.norm.weight,
+                self.rms_norm_eps,
+                cos_sin_cache,
+                cos_sin_cache.stride(0),
+                kv_cache,
+                kv_cache.shape[1],
+                HEAD_SIZE=self.head_dim,
+                TRITON_BLOCK_SIZE=triton.next_power_of_2(self.head_dim),
+                COMPRESS_RATIO=self.compress_ratio,
+                ROPE_HEAD_DIM=self.rope_head_dim,
+                FP8_MAX=448.0,
+                QUANT_BLOCK=self._quant_block,
+                TOKEN_STRIDE=self._token_stride,
+                SCALE_DIM=self._scale_dim,
+                KV_BLOCK_STRIDE=kv_cache.stride(0),
+                num_warps=1,
+                **pdl_kwargs,
+            )
 
 
 @triton.jit

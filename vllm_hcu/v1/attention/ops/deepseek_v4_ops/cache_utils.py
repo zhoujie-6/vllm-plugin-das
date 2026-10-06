@@ -775,7 +775,8 @@ def _combine_topk_swa_indices_kernel(
         token_idx_in_query = token_idx - query_start
         pos = start_pos + token_idx_in_query
         topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
-        swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
+        # A replicated SWA region can be omitted on non-owner DCP ranks.
+        swa_len = tl.minimum(tl.minimum(pos + 1, WINDOW_SIZE), gather_len)
 
         offset = tl.arange(0, PADDED_TOP_K)
         mask = offset < topk_len
@@ -785,7 +786,8 @@ def _combine_topk_swa_indices_kernel(
         )
         tl.store(
             combined_indices_ptr + token_idx * combined_indices_stride + offset,
-            topk_indices + M * batch_idx,
+            tl.where((topk_indices >= 0) & (topk_indices < N),
+                     topk_indices + M * batch_idx, -1),
             mask=mask,
         )
         offset = tl.arange(0, WINDOW_SIZE)
