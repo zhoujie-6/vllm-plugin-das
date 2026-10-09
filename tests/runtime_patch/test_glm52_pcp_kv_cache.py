@@ -150,6 +150,39 @@ def test_multi_group_resolution_scales_attention_groups_by_dcp_only(
     assert hash_size == expected_hash
 
 
+@pytest.mark.parametrize("dcp", [2, 4])
+@pytest.mark.parametrize("single_group", [False, True])
+def test_replicated_state_hash_size_divides_actual_blocks(
+    patched_cache_modules, dcp, single_group,
+):
+    from vllm.v1.core.kv_cache_utils import BlockHashListWithBlockSize
+
+    config = _kv_cache_config(4) if single_group else _kv_cache_config(4, 8, 256)
+    for group in config.kv_cache_groups[:1 if single_group else 2]:
+        group.kv_cache_spec = patched_cache_modules.interface.SlidingWindowMLASpec(
+            block_size=group.kv_cache_spec.block_size,
+            num_kv_heads=1, head_size=8, dtype=torch.float16,
+            sliding_window=16,
+        )
+    vllm_config = _vllm_config(block_size=256, dcp=dcp, pcp=1)
+    scheduler_size, hash_size = patched_cache_modules.resolve(config, vllm_config)
+    assert scheduler_size == (4 if single_group else 256 * dcp)
+    assert hash_size == 4
+    # Prefix-cache lookup converts hashes to each manager's actual block size.
+    hashes = [b"a", b"b", b"c", b"d"]
+    for group in config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        actual_size = spec.block_size * (
+            1 if isinstance(spec, patched_cache_modules.interface.SlidingWindowSpec) else dcp
+        )
+        converted = BlockHashListWithBlockSize(hashes, hash_size, actual_size)
+        assert len(converted) == len(hashes) // (actual_size // hash_size)
+    if not single_group:
+        vllm_config.cache_config.hash_block_size = 8
+        with pytest.raises(ValueError, match="Invalid hash_block_size=8"):
+            patched_cache_modules.resolve(config, vllm_config)
+
+
 @pytest.mark.parametrize(
     ("dcp", "pcp", "expected_blocks"),
     [(1, 1, 5), (1, 2, 5), (2, 1, 3)],

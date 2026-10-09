@@ -178,8 +178,9 @@ def _apply_decode_to_module(module: ModuleType) -> bool:
         vllm_config = args[0] if args else kwargs["vllm_config"]
         if vllm_config.parallel_config.decode_context_parallel_size > 1:
             # Also cover model modules imported before callback registration.
-            from .patch_deepseek_v4_dcp_compressor import apply
+            from .patch_deepseek_v4_dcp_compressor import apply, validate_dcp_flashmla_config
 
+            validate_dcp_flashmla_config(vllm_config)
             apply()
         original_attention_init(self, *args, **kwargs)
         _initialize_dcp_state(self, vllm_config)

@@ -181,6 +181,7 @@ def test_rocm_dcp_constructor_captures_config_without_forward_context(
 
     native_patch = ModuleType("_test_rocm_constructor.patch_deepseek_v4_dcp_compressor")
     native_patch.apply = lambda: None
+    native_patch.validate_dcp_flashmla_config = lambda config: None
     monkeypatch.setitem(sys.modules, native_patch.__name__, native_patch)
     logger = ModuleType("vllm.logger")
     logger.init_logger = lambda name: SimpleNamespace(info_once=lambda *args: None)
@@ -421,6 +422,12 @@ def test_dcp_decode_normalizes_flashmla_lse_and_empty_shard_before_collective(lo
 
 @pytest.mark.parametrize("world_size", [1, 2])
 def test_native_compressor_patch_routes_both_cache_writers(monkeypatch, world_size):
+    platforms = ModuleType("vllm_hcu.platforms")
+    platforms.envs = SimpleNamespace(
+        VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE=True,
+        VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL=True,
+    )
+    monkeypatch.setitem(sys.modules, platforms.__name__, platforms)
     package = ModuleType("_test_dcp_compressor_patch")
     package.__path__ = []
     monkeypatch.setitem(sys.modules, package.__name__, package)
@@ -461,13 +468,55 @@ def test_native_compressor_patch_routes_both_cache_writers(monkeypatch, world_si
     assert patch.apply_to_module(module)
     assert not patch.apply_to_module(module)
     for head_dim in (128, 512):
-        compressor = Compressor(vllm_config=object(), head_dim=head_dim)
+        config = SimpleNamespace(parallel_config=SimpleNamespace(
+            decode_context_parallel_size=world_size,
+        ))
+        compressor = Compressor(vllm_config=config, head_dim=head_dim)
         assert compressor.dcp_group is (group if world_size > 1 else None)
         compressor.forward("score", "positions", "rope")
     assert calls == [
         ("dcp" if world_size > 1 else "original", head_dim, ("score", "positions", "rope"))
         for head_dim in (128, 512)
     ]
+
+
+@pytest.mark.parametrize("decode,prefill", [(False, True), (True, False), (False, False)])
+@pytest.mark.parametrize("world_size", [1, 2])
+def test_dcp_rejects_disabled_flashmla_before_compressor_init(
+    monkeypatch, decode, prefill, world_size,
+):
+    package = ModuleType("_test_dcp_config")
+    package.__path__ = []
+    monkeypatch.setitem(sys.modules, package.__name__, package)
+    _load_source(package.__name__ + "._common",
+                 "vllm_hcu/patch/worker/core_fix/_common.py")
+    patch = _load_source(package.__name__ + ".adapter",
+                        "vllm_hcu/patch/worker/core_fix/patch_deepseek_v4_dcp_compressor.py")
+    platforms = ModuleType("vllm_hcu.platforms")
+    platforms.envs = SimpleNamespace(
+        VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE=decode,
+        VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL=prefill,
+    )
+    monkeypatch.setitem(sys.modules, platforms.__name__, platforms)
+    config = SimpleNamespace(parallel_config=SimpleNamespace(
+        decode_context_parallel_size=world_size,
+    ))
+    if world_size == 1:
+        patch.validate_dcp_flashmla_config(config)
+        return
+
+    class Compressor:
+        def __init__(self, vllm_config):
+            pytest.fail("Unsupported DCP config must fail before allocating caches")
+
+        def forward(self, kv_score, positions, rotary_emb):
+            pass
+
+    module = ModuleType(patch.TARGET_MODULE)
+    module.DeepseekCompressor = Compressor
+    patch.apply_to_module(module)
+    with pytest.raises(ValueError, match="DeepSeek-V4 DCP requires .*FLASHMLA_.*=True"):
+        Compressor(config)
 
 
 @pytest.mark.parametrize("padding", [False, True])

@@ -62,6 +62,13 @@ def apply_to_module(module: ModuleType) -> bool:
         "MambaSpec",
         f"{TARGET_MODULE}.MambaSpec",
     )
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+    def effective_block_size(spec, dcp):
+        sharded = getattr(spec, "dcp_sharded", not isinstance(spec, SlidingWindowSpec))
+        return spec.block_size * (
+            dcp if isinstance(spec, attention_spec) and sharded else 1
+        )
 
     @functools.wraps(original)
     def hcu_resolve_kv_cache_block_sizes(kv_cache_config, vllm_config):
@@ -75,13 +82,14 @@ def apply_to_module(module: ModuleType) -> bool:
         groups = kv_cache_config.kv_cache_groups
 
         if len(groups) <= 1:
-            block_size = cache_config.block_size * dcp
+            block_size = (
+                effective_block_size(groups[0].kv_cache_spec, dcp)
+                if groups else cache_config.block_size * dcp
+            )
             return block_size, block_size
 
         group_block_sizes = [
-            group.kv_cache_spec.block_size * dcp
-            if isinstance(group.kv_cache_spec, attention_spec)
-            else group.kv_cache_spec.block_size
+            effective_block_size(group.kv_cache_spec, dcp)
             for group in groups
         ]
         scheduler_block_size = math.lcm(*group_block_sizes)

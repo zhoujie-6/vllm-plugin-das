@@ -19,6 +19,19 @@ PATCH_ID = "worker.core_fix.deepseek_v4.dcp_compressor"
 _MARKER = "_vllm_hcu_dcp_compressor_applied"
 
 
+def validate_dcp_flashmla_config(config):
+    if config.parallel_config.decode_context_parallel_size <= 1:
+        return
+    from vllm_hcu.platforms import envs as henvs
+
+    for name in (
+        "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE",
+        "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL",
+    ):
+        if not getattr(henvs, name):
+            raise ValueError(f"DeepSeek-V4 DCP requires {name}=True")
+
+
 def apply_to_module(module: ModuleType) -> bool:
     module = load_exact_module(TARGET_MODULE, module)
     cls = require_class(module, "DeepseekCompressor", TARGET_MODULE)
@@ -36,6 +49,7 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(original_init)
     def init(self, *args, **kwargs):
         config = args[0] if args else kwargs["vllm_config"]
+        validate_dcp_flashmla_config(config)
         original_init(self, *args, **kwargs)
         from vllm_hcu.v1.attention.ops.deepseek_v4_ops.dcp import ContextParallelLayout
         from vllm.distributed import get_dcp_group
