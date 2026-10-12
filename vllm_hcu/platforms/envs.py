@@ -74,6 +74,7 @@ if TYPE_CHECKING:
     VLLM_HCU_DEEPEP_NUM_SMS: Optional[int] = None
     VLLM_HCU_DPSK_V4_DEEPEP_LL_USE_HCU_DISPATCH_API: bool = False
     VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE: bool = False
+    VLLM_HCU_DEEPEP_HT_ASYNC_LAYOUT: bool = True
     VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES: bool = True
     VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH: bool = False
     VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS: bool = False
@@ -540,6 +541,9 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
 
     # Launch shared_experts on the auxiliary stream before routed MoE/DeepEP,
     # and wait only when the shared output is consumed.
+    "VLLM_HCU_DEEPEP_HT_ASYNC_LAYOUT":
+        lambda: os.getenv("VLLM_HCU_DEEPEP_HT_ASYNC_LAYOUT", "True").lower()
+        in ("1", "true"),
     "VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES":
         lambda: os.getenv("VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES", "True").lower()
         in ("1", "true"),

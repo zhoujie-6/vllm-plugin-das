@@ -208,18 +208,28 @@ def ht_do_dispatch(
     has_scales = token_scales is not None
     previous_event = module.dbo_get_previous_event(self.buffer.capture)
     module.dbo_yield_and_switch_from_compute_to_comm()
+    from vllm_hcu.platforms import envs as henvs
+    async_layout = (
+        henvs.optional_custom_op_enabled(henvs.VLLM_HCU_DEEPEP_HT_ASYNC_LAYOUT)
+        and self.async_prepare and not module.dbo_enabled()
+    )
     (
         num_tokens_per_rank,
         num_tokens_per_rdma_rank,
         dispatch_expert_num_tokens,
         is_token_in_rank,
-        event,
+        layout_event,
     ) = self.buffer.get_dispatch_layout(
         topk_idx=rank_topk_ids,
         num_experts=num_experts,
         previous_event=previous_event,
-        async_finish=False,
+        async_finish=async_layout,
         allocate_on_comm_stream=False,
+    )
+    # Dispatch must depend on layout completion, not only on the compute
+    # event that preceded layout. Keep the legacy/DBO dependency unchanged.
+    dispatch_event = (
+        layout_event if async_layout and layout_event is not None else previous_event
     )
     token_data = (tokens, token_scales) if has_scales else tokens
     post_dispatch_channel_fp8 = _uses_post_dispatch_channel_fp8_quant(
@@ -259,7 +269,7 @@ def ht_do_dispatch(
         # every other per-token quantization path.
         expert_alignment=expert_alignment,
         config=self._get_dispatch_config(),
-        previous_event=previous_event,
+        previous_event=dispatch_event,
         async_finish=self.async_prepare and not module.dbo_enabled(),
         allocate_on_comm_stream=False,
     )
