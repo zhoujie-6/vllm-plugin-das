@@ -126,6 +126,13 @@ class HcuPCPManager:
         self._padded_gather_idx: torch.Tensor | None = None
         self._gathered_kv_write_mask: torch.Tensor | None = None
         self._hidden_restore_idx_np: np.ndarray | None = None
+        self._padded_gather_idx_np: np.ndarray | None = None
+        self._local_token_indices: torch.Tensor | None = None
+        self._local_token_indices_np: np.ndarray | None = None
+        self._local_real_positions_np: np.ndarray | None = None
+        self._local_query_rows_cache: dict[
+            tuple[int, int], tuple[torch.Tensor, torch.Tensor]
+        ] = {}
         self._padded_num_tokens = 0
         self._local_segments: list[_BatchSegment] = []
         self._global_has_prefill = False
@@ -492,6 +499,7 @@ class HcuPCPManager:
         )
         self._hidden_restore_idx_np = hidden_restore_idx
         self._padded_num_tokens = padded_num_tokens
+        self._padded_gather_idx_np = padded_gather_idx
         self._padded_gather_idx = torch.from_numpy(padded_gather_idx).to(
             self.device
         )
@@ -533,6 +541,26 @@ class HcuPCPManager:
                 )
             ]
         self._local_segments = list(segments)
+        # Layout is known on the CPU. Never rediscover real rows with a
+        # GPU boolean index in every decoder layer (nonzero synchronizes).
+        local_positions = np.concatenate([
+            np.arange(segment.local_slice.start,
+                      segment.local_slice.start + segment.num_actual_tokens,
+                      dtype=np.int64)
+            for segment in segments
+        ])
+        rank_start = self.pcp_rank * self._padded_num_tokens
+        self._local_real_positions_np = local_positions
+        self._local_token_indices_np = (
+            self._padded_gather_idx_np[rank_start:rank_start + self._padded_num_tokens]
+            [local_positions]
+        )
+        # GLM/GQA callers do not use these row indices. Upload lazily so
+        # adding the V4 cache does not add a device copy to their hot path.
+        self._local_token_indices = None
+        # Clear on every partition: identical chunk bounds can belong to a
+        # different request/layout in the next scheduler iteration.
+        self._local_query_rows_cache = {}
         num_local_reqs = len(segments)
         num_local_tokens = per_rank_num_tokens[self.pcp_rank]
         num_padded_tokens = self._padded_num_tokens
@@ -969,6 +997,52 @@ class HcuPCPManager:
             return hidden_states
         gathered = self._pcp_group.all_gather(hidden_states, dim=0)
         return gathered[self._hidden_restore_idx]
+
+    def select_local_tokens(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Select the same padded local layout as partition_batch()."""
+
+        assert self._padded_gather_idx is not None
+        start = self.pcp_rank * self._padded_num_tokens
+        indices = self._padded_gather_idx[start : start + self._padded_num_tokens]
+        return tensor.index_select(0, indices)
+
+    def local_token_indices(self) -> torch.Tensor:
+        """Original indices of real local tokens, including replicated decode."""
+
+        assert self._local_token_indices_np is not None
+        if self._local_token_indices is None:
+            self._local_token_indices = torch.from_numpy(
+                self._local_token_indices_np
+            ).to(self.device)
+        return self._local_token_indices
+
+    def local_query_rows(
+        self, start: int, end: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Chunk-relative global rows and their padded rank-local positions.
+
+        Bounds refer to the original batch, including replicated decode.
+        Selection uses CPU layout metadata; cached device indices are reused
+        by every layer and never require a GPU scalar/boolean synchronization.
+        """
+        assert self._local_token_indices_np is not None
+        assert self._local_real_positions_np is not None
+        key = (int(start), int(end))
+        cached = self._local_query_rows_cache.get(key)
+        if cached is None:
+            owned = self._local_token_indices_np
+            mask = (owned >= key[0]) & (owned < key[1])
+            rows = np.ascontiguousarray(owned[mask] - key[0])
+            local = np.ascontiguousarray(self._local_real_positions_np[mask])
+            cached = (torch.from_numpy(rows).to(self.device),
+                      torch.from_numpy(local).to(self.device))
+            self._local_query_rows_cache[key] = cached
+        return cached
+
+    @property
+    def global_batch(self) -> InputBatch:
+        assert self._global_batch is not None
+        return self._global_batch
 
     def build_plan(self) -> PCPPlan | None:
         """Build the GQA attention plan for a sharded PCP+DCP prefill."""

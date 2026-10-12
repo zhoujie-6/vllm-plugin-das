@@ -2287,3 +2287,93 @@ def test_sidecar_changes_upstream_hash_and_crosses_serialization_boundaries() ->
     process.join(timeout=30)
     assert process.exitcode == 0
     assert queue.get(timeout=5) == enabled["hcu"]
+
+
+@pytest.mark.parametrize("pcp", [2, 8])
+def test_deepep_auto_accepts_deepseek_v4_pcp_without_dp(pcp):
+    from tests.runtime_patch.test_glm52_pcp_config import _make_pcp_config
+
+    config = _make_pcp_config(
+        architecture="DeepseekV4ForCausalLM", pcp=pcp,
+        all2all_backend="deepep_low_latency", enable_eplb=False,
+    )
+    config.additional_config = {
+        "hcu": HcuFeatureConfig(deepep_auto=True, moe_backend="deep_gemm").to_dict()
+    }
+    config.compilation_config = _ValidationCompilation()
+    config.scheduler_config = SimpleNamespace(max_num_batched_tokens=32768)
+    result = patch_vllm_config.validate_and_update_hcu_config(config)
+    assert result.deepep_auto
+    assert config.parallel_config._vllm_hcu_deepep_auto
+    assert config.parallel_config.data_parallel_size == 1
+
+
+@pytest.mark.parametrize("pcp", [2, 8])
+@pytest.mark.parametrize("use_async", [False, True])
+def test_deepep_auto_accepts_channel_v4_eplb_with_pcp(pcp, use_async):
+    from tests.runtime_patch.test_glm52_pcp_config import _make_pcp_config
+
+    config = _make_pcp_config(
+        architecture="DeepseekV4ForCausalLM", pcp=pcp,
+        all2all_backend="deepep_low_latency", enable_eplb=True,
+    )
+    config.model_config.hf_config = SimpleNamespace(quantization_config={
+        "quant_method": "compressed-tensors",
+        "config_groups": {"group_0": {"weights": {
+            "strategy": "channel", "num_bits": 8,
+        }}},
+    })
+    config.parallel_config.eplb_config = SimpleNamespace(use_async=use_async)
+    config.additional_config = {"hcu": HcuFeatureConfig(
+        deepep_auto=True, moe_backend="deep_gemm",
+    ).to_dict()}
+    config.compilation_config = _ValidationCompilation()
+    config.scheduler_config = SimpleNamespace(max_num_batched_tokens=32768)
+    assert patch_vllm_config.validate_and_update_hcu_config(config).deepep_auto
+    assert config.parallel_config.enable_eplb
+    config.model_config.hf_config.quantization_config["config_groups"]["group_0"]["weights"]["num_bits"] = 4
+    with pytest.raises(ValueError, match="deepep_auto.*EPLB"):
+        patch_vllm_config.validate_and_update_hcu_config(config)
+
+
+@pytest.mark.parametrize("normalized", [False, True])
+def test_deepep_auto_eplb_accepts_real_channel_checkpoint_config(normalized):
+    import json
+    from pathlib import Path
+    from tests.runtime_patch.test_glm52_pcp_config import _make_pcp_config
+
+    checkpoint = Path("/llm-models/DeepSeek-V4-Flash-FP8-Channel/config.json")
+    if not checkpoint.exists():
+        pytest.skip("local DeepSeek-V4 channel checkpoint unavailable")
+    hf = json.loads(checkpoint.read_text())
+    assert "compression_config" in hf
+    config = _make_pcp_config(
+        architecture="DeepseekV4ForCausalLM", pcp=8,
+        all2all_backend="deepep_low_latency", enable_eplb=True,
+    )
+    config.model_config.hf_config = SimpleNamespace(**hf)
+    if normalized:
+        config.model_config.model_arch_config = SimpleNamespace(
+            quantization_config=hf["compression_config"]
+        )
+    config.additional_config = {"hcu": HcuFeatureConfig(
+        deepep_auto=True, moe_backend="deep_gemm",
+    ).to_dict()}
+    config.compilation_config = _ValidationCompilation()
+    config.scheduler_config = SimpleNamespace(max_num_batched_tokens=32768)
+    assert patch_vllm_config.validate_and_update_hcu_config(config).deepep_auto
+    assert config.parallel_config.enable_eplb
+
+
+@pytest.mark.parametrize("field", ["quantization_config", "compression_config"])
+def test_channel_eplb_quantization_alias_preserves_rejection(field):
+    hf = SimpleNamespace(**{field: {
+        "quant_method": "compressed-tensors",
+        "config_groups": {"group_0": {"weights": {
+            "strategy": "channel", "num_bits": 8,
+        }}},
+    }})
+    config = SimpleNamespace(model_config=SimpleNamespace(hf_config=hf))
+    assert patch_vllm_config._has_channel_8bit_expert_weights(config)
+    getattr(hf, field)["config_groups"]["group_0"]["weights"]["strategy"] = "block"
+    assert not patch_vllm_config._has_channel_8bit_expert_weights(config)

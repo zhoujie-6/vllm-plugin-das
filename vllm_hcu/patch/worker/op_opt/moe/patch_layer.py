@@ -196,6 +196,14 @@ def apply_to_module(module: ModuleType) -> bool:
     def hcu_get_expert_weights(self):
         if getattr(self, "_dsv4_channel_deepgemm_repacked", False):
             names = ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale")
+            if getattr(self, "_dsv4_channel_deepgemm_layout", None) == "contiguous+masked":
+                # EPLB transfers every tensor before committing the expert map.
+                # Include the independent LL layout so both delegates see the
+                # same logical expert after synchronous or asynchronous moves.
+                names += (
+                    "_dsv4_channel_deepgemm_masked_w13",
+                    "_dsv4_channel_deepgemm_masked_w2",
+                )
             weights = [getattr(self, name, None) for name in names]
             if all(weight is not None for weight in weights):
                 return [weight.view(self.local_num_experts, -1) for weight in weights]

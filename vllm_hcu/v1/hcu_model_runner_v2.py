@@ -19,6 +19,7 @@ from vllm_hcu.forward_context_runtime import (
     set_deepep_auto_request_phase,
 )
 from vllm_hcu.v1.pcp_manager import make_hcu_pcp_manager_cls
+from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4
 
 
 def record_pp_spec_draft_index_stream(
@@ -74,7 +75,11 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         pcp_size = int(
             self.vllm_config.parallel_config.prefill_context_parallel_size
         )
-        if pcp_size > 1 and len(kv_cache_config.kv_cache_groups) != 1:
+        if (
+            pcp_size > 1
+            and not is_deepseek_v4(self.vllm_config)
+            and len(kv_cache_config.kv_cache_groups) != 1
+        ):
             raise ValueError(
                 "HCU PCP requires exactly one KV cache group."
             )
@@ -97,7 +102,12 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             batch_req_state,
             batch_desc,
         )
-        set_deepep_auto_request_phase(input_batch.is_prefilling_np)
+        phase_batch = input_batch
+        if self.pcp_manager is not None and is_deepseek_v4(self.vllm_config):
+            # Empty PCP shards must choose the same DeepEP collective as
+            # ranks owning a real prefill, including one-token prompts.
+            phase_batch = self.pcp_manager.global_batch
+        set_deepep_auto_request_phase(phase_batch.is_prefilling_np)
         return input_batch
 
     @functools.wraps(GPUModelRunner.execute_model)
@@ -115,7 +125,11 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         # batch. Runtime MTP sampling restores the global PCP batch before
         # propose(), so shrinking this shared budget would under-profile the
         # replicated draft prefill even though it is safe for the target.
-        if pcp_size <= 1 or getattr(self, "speculator", None) is not None:
+        if (
+            pcp_size <= 1
+            or is_deepseek_v4(self.vllm_config)
+            or getattr(self, "speculator", None) is not None
+        ):
             return super().profile_run()
 
         original_max = self.max_num_tokens
@@ -143,7 +157,13 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
     def prepare_attn(self, input_batch):
         if self.pcp_manager is None:
             return super().prepare_attn(input_batch)
-        return self.pcp_manager.prepare_attn(input_batch)
+        result = self.pcp_manager.prepare_attn(input_batch)
+        if is_deepseek_v4(self.vllm_config):
+            # V4's compressor and sparse-indexer builders consume original
+            # request rows, while mHC and MoE keep the manager's local layout.
+            input_batch._vllm_hcu_deepseek_v4_pcp_manager = self.pcp_manager
+            return self.pcp_manager.prepare_global_attn()
+        return result
 
     def prepare_dummy_attn(self, input_batch, valid_state_slots=False):
         if self.pcp_manager is None:

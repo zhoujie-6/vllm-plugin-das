@@ -169,6 +169,23 @@ def apply_to_module(module: ModuleType) -> bool:
         for_capture=False,
         ubatch_idx=0,
     ):
+        v4_manager = getattr(
+            input_batch, "_vllm_hcu_deepseek_v4_pcp_manager", None
+        )
+        if v4_manager is not None:
+            from vllm_hcu.model_executor.layers.attention.pcp import (
+                logical_pcp_metadata_scope,
+            )
+
+            with logical_pcp_metadata_scope(1):
+                metadata = original_prepare_attn(
+                    self, v4_manager.global_batch, cudagraph_mode,
+                    block_tables, slot_mappings, attn_groups, kv_cache_config,
+                    for_capture, ubatch_idx,
+                )
+            for item in metadata.values():
+                item._vllm_hcu_deepseek_v4_pcp_manager = v4_manager
+            return metadata
         pcp_size = int(
             self.vllm_config.parallel_config.prefill_context_parallel_size
         )

@@ -1880,6 +1880,64 @@ def test_moe_layer_forward_and_repacked_weight_contract(
         (2, 2),
     ]
 
+    # Auto owns independent HT/LL storage. Both layouts and their shared
+    # scales must be transferred before EPLB publishes the new expert map.
+    experts._dsv4_channel_deepgemm_layout = "contiguous+masked"
+    experts._dsv4_channel_deepgemm_masked_w13 = experts.w13_weight.clone() + 100
+    experts._dsv4_channel_deepgemm_masked_w2 = experts.w2_weight.clone() + 200
+    auto_weights = experts.get_expert_weights()
+    assert len(auto_weights) == 6
+    assert auto_weights[4].data_ptr() == experts._dsv4_channel_deepgemm_masked_w13.data_ptr()
+    assert auto_weights[5].data_ptr() == experts._dsv4_channel_deepgemm_masked_w2.data_ptr()
+    from vllm.distributed.eplb.rebalance_execute import move_from_buffer
+    import numpy as np
+
+    for order in ([1, 0], [0, 1], [1, 0]):
+        before = [w.clone() for w in auto_weights]
+        buffers = [w[order].clone() for w in auto_weights]
+        metadata = SimpleNamespace(
+            is_unchanged=np.zeros(2, dtype=bool),
+            is_received_locally=np.ones(2, dtype=bool),
+            recv_primary_mask=np.zeros(2, dtype=bool),
+            recv_count=0, recv_expert_ids=np.array([], dtype=np.int32),
+            recv_dst_rows=np.array([], dtype=np.int32),
+        )
+        move_from_buffer(auto_weights, buffers, metadata, np.array(order), 0)
+        for actual, old in zip(auto_weights, before):
+            torch.testing.assert_close(actual, old[order])
+        torch.testing.assert_close(auto_weights[4], auto_weights[0] + 100)
+        torch.testing.assert_close(auto_weights[5], auto_weights[1] + 200)
+    # Exercise the real async commit entry: the map callback must observe
+    # both relocated layouts, and the worker is unblocked only afterwards.
+    from vllm.distributed.eplb import eplb_state
+    before = [w.clone() for w in auto_weights]
+    events = []
+    pending = SimpleNamespace(
+        layer_idx=0, transfer_metadata=metadata,
+        new_physical_to_logical_map=torch.tensor([1, 0]),
+        consumed_event=SimpleNamespace(record=lambda: events.append("consumed")),
+    )
+    state = SimpleNamespace(
+        pending_result=pending, rebalanced=True,
+        model=SimpleNamespace(expert_weights=[auto_weights], num_moe_layers=1),
+        expert_buffer=[w[[1, 0]].clone() for w in auto_weights],
+    )
+
+    def commit_map(model_state, **kwargs):
+        assert model_state.pending_result is pending
+        for actual, old in zip(auto_weights, before):
+            torch.testing.assert_close(actual, old[[1, 0]])
+        events.append("map")
+
+    monkeypatch.setattr(eplb_state, "_commit_eplb_maps_for_layer", commit_map)
+    eplb_state._move_to_workspace(state, ep_rank=0)
+    assert events == ["map", "consumed"]
+    assert state.pending_result is None
+    assert not state.rebalanced
+    del experts._dsv4_channel_deepgemm_masked_w2
+    with pytest.raises(RuntimeError, match="masked_w2"):
+        experts.get_expert_weights()
+
     loaded = []
 
     class ChannelScale:
@@ -5772,3 +5830,24 @@ def test_importing_adapters_does_not_eager_import_optional_moe_stacks():
         importlib.reload(adapter)
     for name in optional:
         assert sys.modules.get(name) is before[name]
+
+
+@pytest.mark.parametrize("pcp", [2, 8])
+def test_deepep_auto_uses_internal_dispatch_for_pcp_without_dp(monkeypatch, pcp):
+    import vllm.config
+
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: None)
+    module = _fake_config_module()
+    patch_config.apply_to_module(module)
+    upstream = SimpleNamespace(
+        all2all_backend="deepep_low_latency", enable_expert_parallel=True,
+        _vllm_hcu_deepep_auto=True,
+    )
+    parallel = module.FusedMoEParallelConfig.make(1, pcp, 1, 1, upstream)
+    parallel.is_sequence_parallel = False
+    assert parallel.use_all2all_kernels
+    assert parallel.use_deepep_auto_kernels
+    assert parallel.use_batched_activation_format
+    parallel.use_ep = False
+    assert not parallel.use_all2all_kernels
+    assert not parallel.use_deepep_auto_kernels

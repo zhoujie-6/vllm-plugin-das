@@ -272,11 +272,17 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     )
     is_glm52 = architectures == ["GlmMoeDsaForCausalLM"]
     is_hy4 = architectures == ["HYV4ForCausalLM"]
-    if use_mla and not (is_glm52 or is_hy4):
+    is_dsv4 = architectures == ["DeepseekV4ForCausalLM"]
+    if use_mla and not (is_glm52 or is_hy4 or is_dsv4):
         raise ValueError(
             "GLM-5.2 and HY V4 MLA PCP only support "
-            "GlmMoeDsaForCausalLM or HYV4ForCausalLM."
+            "GlmMoeDsaForCausalLM, HYV4ForCausalLM or DeepseekV4ForCausalLM."
         )
+    if is_dsv4:
+        if not use_mla:
+            raise ValueError("DeepSeek V4 PCP requires sparse MLA.")
+        if getattr(parallel_config, "cp_kv_cache_interleave_size", 1) != 1:
+            raise ValueError("DeepSeek V4 PCP requires Full KV without interleaving.")
     if is_glm52 and not use_mla:
         raise ValueError("GLM-5.2 PCP requires MLA or sparse MLA.")
     if is_hy4 and not use_mla:
@@ -420,6 +426,33 @@ def _validate_dspark_pd_scope(vllm_config: object) -> None:
     )
 
 
+def _has_channel_8bit_expert_weights(vllm_config: object) -> bool:
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    # Prefer vLLM's normalized representation, which also handles the
+    # compressed-tensors compression_config alias used by channel checkpoints.
+    model_arch_config = getattr(model_config, "model_arch_config", None)
+    quant_config = getattr(model_arch_config, "quantization_config", None)
+    if quant_config is None:
+        quant_config = getattr(hf_config, "quantization_config", None)
+    if quant_config is None:
+        quant_config = getattr(hf_config, "compression_config", None)
+    if not isinstance(quant_config, dict):
+        return False
+    if quant_config.get("quant_method") != "compressed-tensors":
+        return False
+    groups = quant_config.get("config_groups", {})
+    if not isinstance(groups, dict) or not groups:
+        return False
+    return all(
+        isinstance(group, dict)
+        and isinstance(group.get("weights"), dict)
+        and group["weights"].get("strategy") == "channel"
+        and group["weights"].get("num_bits") == 8
+        for group in groups.values()
+    )
+
+
 def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     """Validate cross-config invariants and bind the compilation adapter."""
 
@@ -497,13 +530,24 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
                 "HCU deepep_auto must be normalized to the vLLM 0.25 "
                 "deepep_low_latency configuration contract"
             )
-        if getattr(parallel_config, "enable_eplb", False):
+        if getattr(parallel_config, "enable_eplb", False) and not (
+            is_deepseek_v4(vllm_config)
+            and feature_config.moe_backend in ("auto", "deep_gemm")
+            and _has_channel_8bit_expert_weights(vllm_config)
+        ):
             raise ValueError(
-                "deepep_auto with EPLB is not supported because the HT and "
-                "LL expert weight layouts cannot be rebalanced atomically"
+                "deepep_auto with EPLB is not supported for this model or "
+                "quantization; HCU supports DeepSeek-V4 channel-wise 8-bit "
+                "compressed-tensors experts with the deep_gemm backend"
             )
-        if int(getattr(parallel_config, "data_parallel_size", 1)) <= 1:
-            raise ValueError("HCU deepep_auto requires data_parallel_size > 1.")
+        if (
+            int(getattr(parallel_config, "data_parallel_size", 1)) <= 1
+            and int(getattr(parallel_config, "prefill_context_parallel_size", 1)) <= 1
+        ):
+            raise ValueError(
+                "HCU deepep_auto requires data_parallel_size > 1 or "
+                "prefill_context_parallel_size > 1."
+            )
         if not getattr(parallel_config, "enable_expert_parallel", False):
             raise ValueError(
                 "HCU deepep_auto requires enable_expert_parallel=True."
