@@ -76,6 +76,7 @@ if TYPE_CHECKING:
     VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE: bool = False
     VLLM_HCU_DEEPEP_HT_ASYNC_LAYOUT: bool = True
     VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES: bool = True
+    VLLM_HCU_SHARED_EXPERTS_DEEPEP_EPLB_OVERLAP: bool = True
     VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH: bool = False
     VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS: bool = False
     VLLM_HCU_PLE_CPU_OFFLOAD: bool = False
@@ -546,6 +547,9 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
         in ("1", "true"),
     "VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES":
         lambda: os.getenv("VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES", "True").lower()
+        in ("1", "true"),
+    "VLLM_HCU_SHARED_EXPERTS_DEEPEP_EPLB_OVERLAP":
+        lambda: os.getenv("VLLM_HCU_SHARED_EXPERTS_DEEPEP_EPLB_OVERLAP", "True").lower()
         in ("1", "true"),
     "VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH":
         lambda: (os.environ.get("VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH", "False").lower() in
