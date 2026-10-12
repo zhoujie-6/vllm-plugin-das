@@ -38,19 +38,20 @@ def shared_setup(monkeypatch):
         def forward(self, x):
             calls.append(("compute",))
             return x * 3 + 1
-    def build(backend="deepep_auto", safe=True, dbo=False, eplb=True, fi=False):
+    def build(backend="deepep_auto", safe=True, dbo=False, eplb=True, fi=False, mk_overlap=True):
         config = SimpleNamespace(moe_parallel_config=SimpleNamespace(
             enable_eplb=eplb, all2all_backend=backend,
             use_fi_nvl_two_sided_kernels=fi,
         ))
-        return runtime.SharedExperts(Layer(), config, dbo, lambda: False, lambda: safe)
+        return runtime.SharedExperts(Layer(), config, dbo, lambda: mk_overlap, lambda: safe)
     return build, calls
 
 
 @pytest.mark.parametrize("backend", ["deepep_auto", "deepep_high_throughput"])
-def test_early_launch_joins_only_when_consumed(shared_setup, backend):
+@pytest.mark.parametrize("mk_overlap", [True, False])
+def test_early_launch_joins_only_when_consumed(shared_setup, backend, mk_overlap):
     build, calls = shared_setup
-    shared = build(backend=backend)
+    shared = build(backend=backend, mk_overlap=mk_overlap)
     x = torch.arange(8).float().view(2, 4)
     for iteration in range(2):
         calls.clear()
@@ -101,10 +102,12 @@ def test_overlap_rollback_and_resource_guards(shared_setup, monkeypatch, switch)
     else:
         monkeypatch.setattr(runtime.envs, "VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", 1)
     x = torch.ones(2, 4)
-    assert shared._determine_shared_experts_order(x) is runtime.SharedExpertsOrder.NO_OVERLAP
+    expected = (runtime.SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
+                if switch == "threshold" else runtime.SharedExpertsOrder.NO_OVERLAP)
+    assert shared._determine_shared_experts_order(x) is expected
     shared.maybe_sync_shared_experts_stream(x)
     assert not calls
-    shared(x, runtime.SharedExpertsOrder.NO_OVERLAP)
+    shared(x, expected)
     torch.testing.assert_close(shared.output, x * 3 + 1)
 
 

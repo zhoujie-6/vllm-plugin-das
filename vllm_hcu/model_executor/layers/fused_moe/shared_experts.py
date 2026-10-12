@@ -188,9 +188,9 @@ class SharedExperts(torch.nn.Module):
             hidden_states
         )
         if (
-            force_stream
-            and should_run_shared_in_aux_stream
+            should_run_shared_in_aux_stream
             and self._is_multistream_safe()
+            and (force_stream or self._can_overlap_deepep_eplb())
         ):
             return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
 
