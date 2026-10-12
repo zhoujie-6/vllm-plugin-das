@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     VLLM_HCU_DEEPEP_NUM_SMS: Optional[int] = None
     VLLM_HCU_DPSK_V4_DEEPEP_LL_USE_HCU_DISPATCH_API: bool = False
     VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE: bool = False
+    VLLM_HCU_MOE_WORKSPACE_GROWTH_MB: int = 128
     VLLM_HCU_DEEPEP_HT_ASYNC_LAYOUT: bool = True
     VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES: bool = True
     VLLM_HCU_SHARED_EXPERTS_DEEPEP_EPLB_OVERLAP: bool = True
@@ -548,6 +549,9 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
 
     # Launch shared_experts on the auxiliary stream before routed MoE/DeepEP,
     # and wait only when the shared output is consumed.
+    # Round HT MoE scratch capacity to bounded buckets; 0 restores exact sizing.
+    "VLLM_HCU_MOE_WORKSPACE_GROWTH_MB":
+        lambda: int(os.getenv("VLLM_HCU_MOE_WORKSPACE_GROWTH_MB", "128")),
     "VLLM_HCU_DEEPEP_HT_ASYNC_LAYOUT":
         lambda: os.getenv("VLLM_HCU_DEEPEP_HT_ASYNC_LAYOUT", "True").lower()
         in ("1", "true"),
