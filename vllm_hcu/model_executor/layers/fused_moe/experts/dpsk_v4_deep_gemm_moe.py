@@ -11,6 +11,8 @@ activation scales.
 
 import functools
 
+from vllm_hcu.model_executor.layers.fused_moe.ht_gemm_tune import run_ht_fp8_gemm
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -397,7 +399,10 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
             if use_int8
             else m_grouped_fp8_gemm_nt_contiguous
         )
-        grouped_gemm(
+        gemm_call = grouped_gemm if use_int8 else functools.partial(
+            run_ht_fp8_gemm, grouped_gemm
+        )
+        gemm_call(
             (input_tensor, input_scale),
             (w13_deepgemm, self.w1_scale),
             gateup_output,
@@ -428,7 +433,7 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
         del gateup_output
 
         down_output = _resize_cache(workspace2, (m_aligned, K))
-        grouped_gemm(
+        gemm_call(
             (q_activation, q_activation_scale),
             (w2_deepgemm, self.w2_scale),
             down_output,

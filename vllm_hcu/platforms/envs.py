@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     VLLM_HCU_DEEPEP_NUM_SMS: Optional[int] = None
     VLLM_HCU_DPSK_V4_DEEPEP_LL_USE_HCU_DISPATCH_API: bool = False
     VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE: bool = False
+    VLLM_HCU_DEEPEP_HT_GEMM_TUNE: bool = False
     VLLM_HCU_DEEPEP_HT_EXACT_LAYOUT: bool = True
     VLLM_HCU_PCP_ASYNC_METADATA: bool = True
     VLLM_HCU_MOE_WORKSPACE_GROWTH_MB: int = 128
@@ -553,6 +554,9 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # and wait only when the shared output is consumed.
     # Round HT MoE scratch capacity to bounded buckets; 0 restores exact sizing.
     # Trust only shape-bound physical expert counts returned by DeepEP HT.
+    # Opt-in startup-only FP8 grouped GEMM tile calibration.
+    "VLLM_HCU_DEEPEP_HT_GEMM_TUNE":
+        lambda: os.getenv("VLLM_HCU_DEEPEP_HT_GEMM_TUNE", "False").lower() in ("true", "1"),
     "VLLM_HCU_DEEPEP_HT_EXACT_LAYOUT":
         lambda: os.getenv("VLLM_HCU_DEEPEP_HT_EXACT_LAYOUT", "True").lower() in ("true", "1"),
     "VLLM_HCU_PCP_ASYNC_METADATA":

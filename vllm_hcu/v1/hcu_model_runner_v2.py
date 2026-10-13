@@ -130,6 +130,12 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             or is_deepseek_v4(self.vllm_config)
             or getattr(self, "speculator", None) is not None
         ):
+            if is_deepseek_v4(self.vllm_config):
+                from vllm_hcu.model_executor.layers.fused_moe.ht_gemm_tune import (
+                    ht_gemm_profile_scope,
+                )
+                with ht_gemm_profile_scope():
+                    return super().profile_run()
             return super().profile_run()
 
         original_max = self.max_num_tokens
