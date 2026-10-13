@@ -64,6 +64,7 @@ def _sample(indices):
 def _calibrate(fn, a, b, output, indices):
     rows = _sample(indices)
     if rows.numel() == 0:
+        logger.info_once("HT FP8 GEMM calibration skipped: startup layout has no valid expert rows.")
         return None
     def call(config):
         if config is None:
@@ -87,6 +88,9 @@ def _calibrate(fn, a, b, output, indices):
 
 def run_ht_fp8_gemm(fn, a, b, output, indices):
     enabled = henvs.optional_custom_op_enabled(henvs.VLLM_HCU_DEEPEP_HT_GEMM_TUNE)
+    if enabled and _profile.get():
+        logger.info_once("HT FP8 GEMM startup eligibility: supported=%s input_dtype=%s output_dtype=%s weight_ndim=%s indices_dtype=%s",
+                         _supported(a, b, output, indices), a[0].dtype, output.dtype, b[0].ndim, indices.dtype)
     if not enabled or not _supported(a, b, output, indices):
         return fn(a, b, output, indices)
     key = _key(a, b, output)

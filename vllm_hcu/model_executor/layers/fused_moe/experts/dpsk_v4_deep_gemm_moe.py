@@ -400,7 +400,7 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
             else m_grouped_fp8_gemm_nt_contiguous
         )
         gemm_call = grouped_gemm if use_int8 else functools.partial(
-            run_ht_fp8_gemm, grouped_gemm
+            run_ht_fp8_gemm, _deepgemm_op("m_grouped_fp8_gemm_nt_contiguous")
         )
         gemm_call(
             (input_tensor, input_scale),

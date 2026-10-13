@@ -139,3 +139,67 @@ def test_legacy_vendor_api_without_config_retains_original_call(setup):
         tune.run_ht_fp8_gemm(old_fn, a, b, out, ids)
     assert calls == [None]
     assert list(tune._cache.values()) == [None]
+
+
+def test_expert_apply_calibrates_vendor_callable_instead_of_lazy_wrapper(setup, monkeypatch):
+    from types import SimpleNamespace
+    from vllm_hcu.model_executor.layers.fused_moe.experts import dpsk_v4_deep_gemm_moe as experts
+    a, b, out, ids, fn, calls = setup
+    monkeypatch.setattr(experts, "_deepgemm_op", lambda name: fn)
+    monkeypatch.setattr(experts, "compute_aligned_M", lambda **kwargs: 8)
+    monkeypatch.setattr(experts, "deepgemm_moe_permute",
+                        lambda **kwargs: (a[0], a[1], ids, ids, 256))
+    monkeypatch.setattr(experts, "fuse_silu_mul_fp8_quant", lambda *args, **kwargs: a)
+    monkeypatch.setattr(experts, "deepgemm_unpermute_and_reduce",
+                        lambda **kwargs: kwargs["output"].copy_(kwargs["a"]))
+    expert = SimpleNamespace(quant_config=SimpleNamespace(use_int8_w8a8=False,
+                             gemm1_clamp_limit=None), w1_scale=b[1], w2_scale=b[1],
+                             _deepgemm_w13=b[0], _deepgemm_w2=b[0], ALIGNMENT=256,
+                             moe_problem_size=lambda *args: (2, 8, 2, 2, 1),
+                             _ensure_2d_scale=lambda scale: scale)
+    def apply():
+        experts.DeepEPDeepGemmContiguousExperts._apply_deepgemm_ht(
+            expert, out, a[0], b[0], b[0], torch.ones((8, 1)),
+            torch.zeros((8, 1), dtype=torch.int32), experts.MoEActivation.SILU,
+            2, None, a[1], None, torch.empty((8, 2)), torch.empty((8, 2)),
+            None, False)
+    with tune.ht_gemm_profile_scope():
+        apply()
+    assert any(config and config["BLOCK_M"] == 64 for config in calls)
+    calls.clear()
+    apply()
+    assert len(calls) == 2
+    assert all(config and config["BLOCK_M"] == 64 for config in calls)
+    torch.testing.assert_close(out, a[0] @ b[0])
+
+
+@pytest.mark.parametrize("v2,eager,v4,child,master,enabled", [
+    (True, True, True, True, True, True),
+    (False, True, True, True, True, False),
+    (True, False, True, True, True, False),
+    (True, True, False, True, True, False),
+    (True, True, True, False, True, False),
+    (True, True, True, True, False, False),
+])
+def test_startup_prefill_calibration_scope_and_guards(monkeypatch, v2, eager, v4, child, master, enabled):
+    from types import SimpleNamespace
+    from vllm_hcu.v1.worker import HcuGPUWorker
+    from vllm_hcu import deepseek_v4_runtime
+    from vllm.v1.worker.gpu import warmup
+    import vllm_hcu.v1.worker as worker_module
+    calls = []
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1" if master else "0")
+    monkeypatch.setenv("VLLM_HCU_DEEPEP_HT_GEMM_TUNE", "1" if child else "0")
+    monkeypatch.setattr(deepseek_v4_runtime, "is_deepseek_v4", lambda config: v4)
+    def run(*args, **kwargs):
+        calls.append((tune._profile.get(), args[3], kwargs["req_id_prefix"]))
+        return True
+    monkeypatch.setattr(warmup, "run_mixed_prefill_decode_warmup", run)
+    monkeypatch.setattr(worker_module, "set_random_seed", lambda seed: calls.append(seed))
+    w = SimpleNamespace(use_v2_model_runner=v2, model_config=SimpleNamespace(enforce_eager=eager, seed=42),
+                        vllm_config=object(), scheduler_config=SimpleNamespace(max_num_batched_tokens=32768),
+                        model_runner=object(), execute_model=lambda *args: None, sample_tokens=lambda *args: None,
+                        _compile_or_warm_up_model_base=lambda: "base result")
+    assert HcuGPUWorker.compile_or_warm_up_model(w) == "base result"
+    assert calls == ([(True, 32768, "_hcu_ht_gemm_calibration"), 42] if enabled else [])
+    assert not tune._profile.get()

@@ -108,6 +108,31 @@ class HcuGPUWorker(Worker):
         validate_worker_patches(require_applied=True)
 
     def compile_or_warm_up_model(self):
+        result = self._compile_or_warm_up_model_base()
+        from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4
+        from vllm_hcu.platforms import envs as henvs
+        # MRV2 memory profiling does not run the normal-input HT prefill path.
+        # Calibrate only before serving, with live KV storage and eager execution.
+        if (
+            self.use_v2_model_runner
+            and self.model_config.enforce_eager
+            and is_deepseek_v4(self.vllm_config)
+            and henvs.optional_custom_op_enabled(henvs.VLLM_HCU_DEEPEP_HT_GEMM_TUNE)
+        ):
+            from vllm.v1.worker.gpu.warmup import run_mixed_prefill_decode_warmup
+            from vllm_hcu.model_executor.layers.fused_moe.ht_gemm_tune import ht_gemm_profile_scope
+            runner_logger.info("HT FP8 GEMM startup prefill calibration: %d tokens",
+                               self.scheduler_config.max_num_batched_tokens)
+            with ht_gemm_profile_scope():
+                run_mixed_prefill_decode_warmup(
+                    self.model_runner, self.execute_model, self.sample_tokens,
+                    self.scheduler_config.max_num_batched_tokens,
+                    req_id_prefix="_hcu_ht_gemm_calibration",
+                )
+            set_random_seed(self.model_config.seed)
+        return result
+
+    def _compile_or_warm_up_model_base(self):
         if (
             self.use_v2_model_runner
             and self.parallel_config.pipeline_parallel_size > 1
