@@ -15,6 +15,8 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
+import vllm_hcu.platforms.envs as henvs
+
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID, get_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
@@ -379,11 +381,34 @@ class HcuPCPManager:
             input_batch.query_start_loc_np,
         )
 
+    def _upload_metadata(self, array: np.ndarray) -> torch.Tensor:
+        """Snapshot CPU indices and enqueue H2D on the consumer's stream.
+
+        pin_memory copies the NumPy-backed tensor into independent storage,
+        so later CPU layout mutations cannot race the DMA. Never overwrite
+        pinned storage while a previous batch's copy may still be in flight.
+        """
+        source = torch.from_numpy(array)
+        if (
+            torch.device(self.device).type != "cuda"
+            or not henvs.optional_custom_op_enabled(henvs.VLLM_HCU_PCP_ASYNC_METADATA)
+            or source.numel() == 0
+        ):
+            return source.to(self.device)
+        pinned = source.pin_memory()
+        if not hasattr(self, "_metadata_upload_sources"):
+            self._metadata_upload_sources = []
+        self._metadata_upload_sources.append(pinned)
+        return pinned.to(self.device, non_blocking=True)
+
     def _build_batch_layout(
         self,
         input_batch: InputBatch,
         padded_num_tokens: int | None = None,
     ) -> tuple[list[list[_BatchSegment]], list[int]]:
+        # Keep each batch's pinned snapshots alive without reusing their storage.
+        # Released pinned blocks are protected by PyTorch's copy-stream events.
+        self._metadata_upload_sources = []
         segments_by_rank = [
             self._segments_for_rank(rank, input_batch)
             for rank in range(self.pcp_size)
@@ -494,18 +519,12 @@ class HcuPCPManager:
                         dtype=np.int64,
                     )
 
-        self._hidden_restore_idx = torch.from_numpy(hidden_restore_idx).to(
-            self.device
-        )
+        self._hidden_restore_idx = self._upload_metadata(hidden_restore_idx)
         self._hidden_restore_idx_np = hidden_restore_idx
         self._padded_num_tokens = padded_num_tokens
         self._padded_gather_idx_np = padded_gather_idx
-        self._padded_gather_idx = torch.from_numpy(padded_gather_idx).to(
-            self.device
-        )
-        self._gathered_kv_write_mask = torch.from_numpy(kv_write_mask).to(
-            self.device
-        )
+        self._padded_gather_idx = self._upload_metadata(padded_gather_idx)
+        self._gathered_kv_write_mask = self._upload_metadata(kv_write_mask)
         return segments_by_rank, per_rank_num_tokens
 
     def partition_batch(
@@ -1011,9 +1030,7 @@ class HcuPCPManager:
 
         assert self._local_token_indices_np is not None
         if self._local_token_indices is None:
-            self._local_token_indices = torch.from_numpy(
-                self._local_token_indices_np
-            ).to(self.device)
+            self._local_token_indices = self._upload_metadata(self._local_token_indices_np)
         return self._local_token_indices
 
     def local_query_rows(
@@ -1034,8 +1051,8 @@ class HcuPCPManager:
             mask = (owned >= key[0]) & (owned < key[1])
             rows = np.ascontiguousarray(owned[mask] - key[0])
             local = np.ascontiguousarray(self._local_real_positions_np[mask])
-            cached = (torch.from_numpy(rows).to(self.device),
-                      torch.from_numpy(local).to(self.device))
+            cached = (self._upload_metadata(rows),
+                      self._upload_metadata(local))
             self._local_query_rows_cache[key] = cached
         return cached
 
