@@ -12,6 +12,7 @@ from typing import Any
 import torch
 
 from vllm_hcu.platforms.hcu import on_gfx938
+from vllm_hcu.utils.compressor_gemm import compressor_mm
 
 from ._common import (
     PatchCompatibilityError,
@@ -42,8 +43,7 @@ _INDEXER_Q_WRAPPER_MARKER = "_vllm_hcu_bf16_indexer_query_wrapper"
 
 def _compressor_mm(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """Multiply either HCU NN ``[in, out]`` or upstream ``[out, in]`` weights."""
-    rhs = weight if weight.shape[0] == hidden_states.shape[-1] else weight.T
-    return torch.mm(hidden_states, rhs, out_dtype=torch.float32)
+    return compressor_mm(hidden_states, weight)
 
 
 def _requires_unquantized_int8_wo_a(vllm_config: object) -> bool:
