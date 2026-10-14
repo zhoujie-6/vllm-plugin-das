@@ -2377,3 +2377,35 @@ def test_channel_eplb_quantization_alias_preserves_rejection(field):
     assert patch_vllm_config._has_channel_8bit_expert_weights(config)
     getattr(hf, field)["config_groups"]["group_0"]["weights"]["strategy"] = "block"
     assert not patch_vllm_config._has_channel_8bit_expert_weights(config)
+
+
+def test_cli_init_expert_location_is_stored_and_requires_eplb(tmp_path) -> None:
+    location = tmp_path / "dump.pt"
+    torch.save({"logical_count": torch.ones(2, 4, dtype=torch.int32)}, location)
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--moe-backend", choices=["auto", "deep_gemm"], default="auto"
+    )
+    parser.add_argument("--additional-config", type=json.loads, default={})
+    patch_hcu_config.register_hcu_cli_args(parser)
+    module = _make_arg_utils_module()
+    patch_engine_args.apply_to_module(module)
+
+    omitted = module.EngineArgs.from_cli_args(parser.parse_args([]))
+    assert get_hcu_config(omitted).init_expert_location is None
+
+    engine_args = module.EngineArgs.from_cli_args(
+        parser.parse_args(["--init-expert-location", str(location)])
+    )
+    assert get_hcu_config(engine_args).init_expert_location == str(location)
+
+    with pytest.raises(ValueError, match="requires --enable-eplb"):
+        engine_args.create_engine_config()
+    engine_args.enable_eplb = True
+    config = engine_args.create_engine_config()
+    assert get_hcu_config(config).init_expert_location == str(location)
+
+    missing = module.EngineArgs(init_expert_location=str(tmp_path / "none.pt"))
+    missing.enable_eplb = True
+    with pytest.raises(FileNotFoundError):
+        missing.create_engine_config()

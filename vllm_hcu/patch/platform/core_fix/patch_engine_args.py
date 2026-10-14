@@ -45,6 +45,7 @@ _HCU_BOOLEAN_KWARGS = (
     "enable_custom_sp",
     "enable_multi_layers_mtp",
 )
+_HCU_STRING_KWARGS = ("init_expert_location",)
 _DEEP_GEMM_BACKEND = "deep_gemm"
 _LEGACY_DEEP_GEMM_BACKEND = "dpsk_deep_gemm"
 _UPSTREAM_BACKEND = "auto"
@@ -112,7 +113,7 @@ def _normalise_constructor_kwargs(
     top_level_multi_mtp_present = "enable_multi_layers_mtp" in kwargs
     updates = {
         name: kwargs.pop(name)
-        for name in _HCU_BOOLEAN_KWARGS
+        for name in _HCU_BOOLEAN_KWARGS + _HCU_STRING_KWARGS
         if name in kwargs
     }
     # Bind after removing HCU-only keywords so positional official arguments
@@ -428,6 +429,22 @@ def _normalise_existing_engine_args(engine_args: object) -> HcuFeatureConfig:
     return feature_config
 
 
+def _validate_init_expert_location(
+    engine_args: object, feature_config: HcuFeatureConfig
+) -> None:
+    location = feature_config.init_expert_location
+    if location is None:
+        return
+    if not getattr(engine_args, "enable_eplb", False):
+        raise ValueError("--init-expert-location requires --enable-eplb")
+    # Fail in the API process instead of in every worker during load_model.
+    from vllm_hcu.distributed.eplb_init_location import (
+        load_expert_location_payload,
+    )
+
+    load_expert_location_payload(location)
+
+
 def _wrap_constructor(owner: type) -> None:
     original = vars(owner)["__init__"]
     signature = inspect.signature(original)
@@ -507,7 +524,7 @@ def apply_to_module(module: ModuleType) -> bool:
         feature_config = get_hcu_config(engine_args_instance)
         updates = {
             name: getattr(args, name)
-            for name in _HCU_BOOLEAN_KWARGS[:3]
+            for name in _HCU_BOOLEAN_KWARGS[:3] + _HCU_STRING_KWARGS
             if hasattr(args, name)
         }
         if updates:
@@ -544,6 +561,7 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(create_engine_config)
     def hcu_create_engine_config(self, *args: Any, **kwargs: Any):
         feature_config = _normalise_existing_engine_args(self)
+        _validate_init_expert_location(self, feature_config)
         config = create_engine_config(self, *args, **kwargs)
         resolved_config = get_hcu_config(config)
         # VllmConfig.__post_init__ calls the platform hook before returning

@@ -220,6 +220,7 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_bf16_compressor")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_c128_splits")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_load_weights")),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_eplb")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_dspark_target")),
     _CallbackSpec(
         _adapter("core_fix", "patch_deepseek_v4_rocm_compressor_fusion")
@@ -390,6 +391,7 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(
         _adapter("framework_opt", "patch_all2all"), feature="deepep"
     ),
+    _CallbackSpec(_adapter("framework_opt", "patch_eplb_init_location")),
     _CallbackSpec(
         _adapter("framework_opt", "patch_cuda_communicator"),
         patch_id=_CUDA_VALIDATION_ID,

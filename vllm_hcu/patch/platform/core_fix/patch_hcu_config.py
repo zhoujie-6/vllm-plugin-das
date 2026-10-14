@@ -13,6 +13,14 @@ _HCU_BOOLEAN_OPTIONS = {
     "enable_lightly_cplb": "Enable HCU lightly-CP load balancing.",
     "enable_custom_sp": "Enable HCU custom runtime sequence parallelism.",
 }
+_HCU_STRING_OPTIONS = {
+    "init_expert_location": (
+        "Initial EPLB expert placement applied once after model loading. "
+        "Accepts an SGLang expert_distribution_recorder dump (.pt/.json with "
+        "'logical_count') or a mapping with 'physical_to_logical_map'. "
+        "Requires --enable-eplb."
+    ),
+}
 _DEEP_GEMM_BACKEND = "deep_gemm"
 _LEGACY_DEEP_GEMM_BACKEND = "dpsk_deep_gemm"
 
@@ -70,11 +78,21 @@ def register_hcu_cli_args(parser: object) -> None:
             # overwrite a True value supplied via --additional-config.
             existing.default = argparse.SUPPRESS
 
-    group = None
-    for dest, help_text in _HCU_BOOLEAN_OPTIONS.items():
-        if dest in by_dest:
-            continue
+    for dest in _HCU_STRING_OPTIONS:
         option = "--" + dest.replace("_", "-")
+        existing = by_dest.get(dest)
+        if existing is not None:
+            if option not in existing.option_strings or existing.nargs is not None:
+                raise PatchCompatibilityError(
+                    f"CLI destination {dest!r} is already registered with "
+                    "incompatible semantics"
+                )
+            existing.default = argparse.SUPPRESS
+
+    group = None
+
+    def hcu_group():
+        nonlocal group
         if group is None:
             group = add_group(
                 title="HCUFeatureConfig",
@@ -82,10 +100,27 @@ def register_hcu_cli_args(parser: object) -> None:
                     "HCU-only options stored in VllmConfig.additional_config['hcu']."
                 ),
             )
-        group.add_argument(
+        return group
+
+    for dest, help_text in _HCU_BOOLEAN_OPTIONS.items():
+        if dest in by_dest:
+            continue
+        option = "--" + dest.replace("_", "-")
+        hcu_group().add_argument(
             option,
             dest=dest,
             action="store_true",
+            default=argparse.SUPPRESS,
+            help=help_text,
+        )
+    for dest, help_text in _HCU_STRING_OPTIONS.items():
+        if dest in by_dest:
+            continue
+        option = "--" + dest.replace("_", "-")
+        hcu_group().add_argument(
+            option,
+            dest=dest,
+            type=str,
             default=argparse.SUPPRESS,
             help=help_text,
         )

@@ -56,6 +56,7 @@ def test_dict_vllm_config_uses_canonical_storage_path() -> None:
                 "fused_qwen3_rms_rope": True,
                 "moe_backend": "auto",
                 "hcu_flash_attn_mode": None,
+                "init_expert_location": None,
             }
         }
     }

@@ -24,6 +24,7 @@ _FEATURE_FIELDS = (
     "fused_qwen3_rms_rope",
     "moe_backend",
     "hcu_flash_attn_mode",
+    "init_expert_location",
 )
 _BOOLEAN_FIELDS = _FEATURE_FIELDS[:6]
 _SUPPORTED_MOE_BACKENDS = frozenset({"auto", "deep_gemm"})
@@ -74,6 +75,9 @@ class HcuFeatureConfig:
     fused_qwen3_rms_rope: bool = True
     moe_backend: str = "auto"
     hcu_flash_attn_mode: str | None = None
+    # Offline expert load (SGLang ``expert_distribution_recorder`` dump) or a
+    # precomputed physical_to_logical_map, applied once after model loading.
+    init_expert_location: str | None = None
 
     def __post_init__(self) -> None:
         for name in _BOOLEAN_FIELDS:
@@ -108,6 +112,14 @@ class HcuFeatureConfig:
                     "unsupported HCU hcu_flash_attn_mode "
                     f"{self.hcu_flash_attn_mode!r}; expected one of {supported}"
                 )
+        if self.init_expert_location is not None and (
+            not isinstance(self.init_expert_location, str)
+            or not self.init_expert_location
+        ):
+            raise TypeError(
+                "HCU config field 'init_expert_location' must be a non-empty str "
+                f"or None, got {self.init_expert_location!r}"
+            )
         if self.enable_lightly_cplb and not self.enable_lightly_cp:
             raise ValueError("enable_lightly_cplb requires enable_lightly_cp")
 
