@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     VLLM_HCU_DEEPEP_NUM_SMS: Optional[int] = None
     VLLM_HCU_DPSK_V4_DEEPEP_LL_USE_HCU_DISPATCH_API: bool = False
     VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE: bool = False
+    VLLM_HCU_INVERSE_ROPE_SUFFIX: bool = True
     VLLM_HCU_COMPRESSOR_GEMM_BACKEND: str = "blaslt"
     VLLM_HCU_C128_HEAD_SPLITS: int = 4
     VLLM_HCU_DEEPEP_HT_GEMM_TUNE: bool = False
@@ -558,6 +559,8 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # Trust only shape-bound physical expert counts returned by DeepEP HT.
     # Opt-in startup-only FP8 grouped GEMM tile calibration.
     # C128 prefill head tiles on HCU; 0 restores the upstream CU heuristic.
+    "VLLM_HCU_INVERSE_ROPE_SUFFIX":
+        lambda: _environment_flag(os.getenv("VLLM_HCU_INVERSE_ROPE_SUFFIX", "1")),
     "VLLM_HCU_COMPRESSOR_GEMM_BACKEND":
         lambda: os.getenv("VLLM_HCU_COMPRESSOR_GEMM_BACKEND", "blaslt"),
     "VLLM_HCU_C128_HEAD_SPLITS":
