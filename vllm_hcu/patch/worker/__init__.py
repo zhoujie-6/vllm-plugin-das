@@ -392,6 +392,7 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
         _adapter("framework_opt", "patch_all2all"), feature="deepep"
     ),
     _CallbackSpec(_adapter("framework_opt", "patch_eplb_init_location")),
+    _CallbackSpec(_adapter("framework_opt", "patch_kv_zero_by_group")),
     _CallbackSpec(
         _adapter("framework_opt", "patch_cuda_communicator"),
         patch_id=_CUDA_VALIDATION_ID,
