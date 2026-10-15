@@ -8,7 +8,9 @@ import triton.language as tl
 
 @triton.jit
 def _inverse_rope_suffix_inplace_kernel(
-    output, positions, cache, count: tl.constexpr, heads: tl.constexpr,
+    # count scales with the token count: keep it runtime so each new batch
+    # size does not trigger a ~200 ms JIT compile on the critical path.
+    output, positions, cache, count, heads: tl.constexpr,
     token_stride: tl.constexpr, head_stride: tl.constexpr,
     cache_stride: tl.constexpr, nope: tl.constexpr, half: tl.constexpr,
     BLOCK: tl.constexpr,

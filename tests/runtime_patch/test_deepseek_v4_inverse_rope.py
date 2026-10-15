@@ -85,3 +85,9 @@ def test_optimized_projection_keeps_weight_adapter_and_wo_b(monkeypatch):
     layer._bpre_attn_gemm=lambda *a: a
     result=layer._o_proj(o.clone(),torch.arange(3))
     assert result[0:2] == ('weight','scale') and result[3] is True
+
+
+def test_kernel_does_not_specialize_on_token_count():
+    from vllm_hcu.utils import deepseek_v4_inverse_rope as kernel
+    params = {p.name: p.is_constexpr for p in kernel._inverse_rope_suffix_inplace_kernel.params}
+    assert params['count'] is False
