@@ -20,6 +20,7 @@ from vllm_hcu.forward_context_runtime import (
 )
 from vllm_hcu.v1.pcp_manager import make_hcu_pcp_manager_cls
 from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4
+from vllm_hcu.patch.platform.core_fix.patch_vllm_config import is_glm53_pcp
 
 
 def record_pp_spec_draft_index_stream(
@@ -58,6 +59,18 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         if not hasattr(self, "pcp_manager"):
             self.pcp_manager = None
 
+    def load_model(self, load_dummy_weights: bool = False) -> None:
+        """Load and pack GLM router weights in the worker weights pool."""
+
+        super().load_model(load_dummy_weights=load_dummy_weights)
+        from vllm_hcu.model_executor.layers.fused_moe.glm53_router_gemv import (
+            bind_glm53_router_gates,
+        )
+
+        self._vllm_hcu_num_router_gates = bind_glm53_router_gates(
+            getattr(self, "model", None)
+        )
+
     @property
     def pcp_manager_cls(self):
         if self._hcu_pcp_manager_cls is None:
@@ -79,12 +92,18 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             pcp_size > 1
             and not is_deepseek_v4(self.vllm_config)
             and len(kv_cache_config.kv_cache_groups) != 1
+            and not is_glm53_pcp(self.vllm_config)
         ):
             raise ValueError(
                 "HCU PCP requires exactly one KV cache group."
             )
         from vllm_hcu.v1.kv_cache import use_hcu_flash_kv_cache_allocator
 
+        if is_glm53_pcp(self.vllm_config):
+            from vllm_hcu.v1.glm53_pcp import install_glm53_pcp
+
+            # Install before upstream discovers backends and checks PCP support.
+            install_glm53_pcp(self)
         with use_hcu_flash_kv_cache_allocator(self):
             super().initialize_kv_cache(
                 kv_cache_config,
@@ -108,11 +127,23 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             # ranks owning a real prefill, including one-token prompts.
             phase_batch = self.pcp_manager.global_batch
         set_deepep_auto_request_phase(phase_batch.is_prefilling_np)
+        if is_glm53_pcp(self.vllm_config):
+            from vllm_hcu.v1.glm53_pcp import bind_glm53_pcp_batch
+
+            bind_glm53_pcp_batch(self.pcp_manager, input_batch)
         return input_batch
 
     @functools.wraps(GPUModelRunner.execute_model)
     def execute_model(self, *args, **kwargs):
-        with deepep_auto_request_phase_scope():
+        scope = nullcontext()
+        dummy_scope = nullcontext()
+        if is_glm53_pcp(self.vllm_config):
+            from vllm_hcu.v1.glm53_pcp import glm53_pcp_step_scope
+
+            scope = glm53_pcp_step_scope()
+            if kwargs.get("dummy_run", False):
+                dummy_scope = replicated_mtp_batch_scope()
+        with deepep_auto_request_phase_scope(), scope, dummy_scope:
             return super().execute_model(*args, **kwargs)
 
     def profile_run(self) -> None:
@@ -128,6 +159,8 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         if (
             pcp_size <= 1
             or is_deepseek_v4(self.vllm_config)
+            # GLM5Next KDA and K-pool see the full, replicated token batch.
+            or is_glm53_pcp(self.vllm_config)
             or getattr(self, "speculator", None) is not None
         ):
             if is_deepseek_v4(self.vllm_config):
@@ -172,6 +205,13 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         return result
 
     def prepare_dummy_attn(self, input_batch, valid_state_slots=False):
+        if is_glm53_pcp(self.vllm_config):
+            manager = self.pcp_manager
+            self.pcp_manager = None
+            try:
+                return super().prepare_dummy_attn(input_batch, valid_state_slots)
+            finally:
+                self.pcp_manager = manager
         if self.pcp_manager is None:
             return super().prepare_dummy_attn(input_batch, valid_state_slots)
         block_tables = self.block_tables.get_dummy_block_tables(

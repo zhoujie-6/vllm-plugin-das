@@ -266,7 +266,12 @@ def test_prepare_is_lazy_narrow_idempotent_and_keeps_main_role():
         "'vllm_hcu.model_executor.layers.fused_moe.aiter_ops'}; "
         "initial_targets=sorted(targets & sys.modules.keys()); "
         "assert initial_targets==["
-        "'vllm.distributed.device_communicators.base_device_communicator']; "
+        "'vllm.distributed.device_communicators.base_device_communicator',"
+        "'vllm.forward_context',"
+        "'vllm.utils.deep_gemm',"
+        "'vllm.v1.attention.backend',"
+        "'vllm.v1.worker.dp_utils',"
+        "'vllm.v1.worker.ubatch_utils']; "
         "assert not (business & sys.modules.keys()); "
         "first=prepare_worker_patches(); second=prepare_worker_patches(); "
         "print(json.dumps({'first':len(first),'second':len(second),"
@@ -291,16 +296,70 @@ def test_prepare_is_lazy_narrow_idempotent_and_keeps_main_role():
         "callbacks": expected_callbacks,
         "statuses": ["applied", "armed"],
         "initial_targets_loaded": [
-            "vllm.distributed.device_communicators.base_device_communicator"
+            "vllm.distributed.device_communicators.base_device_communicator",
+            "vllm.forward_context",
+            "vllm.utils.deep_gemm",
+            "vllm.v1.attention.backend",
+            "vllm.v1.worker.dp_utils",
+            "vllm.v1.worker.ubatch_utils",
         ],
         "targets_loaded": [
-            "vllm.distributed.device_communicators.base_device_communicator"
+            "vllm.distributed.device_communicators.base_device_communicator",
+            "vllm.forward_context",
+            "vllm.utils.deep_gemm",
+            "vllm.v1.attention.backend",
+            "vllm.v1.worker.dp_utils",
+            "vllm.v1.worker.ubatch_utils",
         ],
         "business_loaded": [],
         "runner_loaded": False,
         "shared_loaded": False,
         "builtins_same": True,
         "role": "Main",
+    }
+
+
+def test_custom_ops_zero_does_not_import_fused_ple_ops():
+    result = _run_fresh(
+        "import json,os,sys; "
+        "os.environ['VLLM_HCU_USE_CUSTOM_OPS']='0'; "
+        "from vllm_hcu.patch.platform import apply_platform_patches; "
+        "from vllm_hcu.patch.worker import prepare_worker_patches; "
+        "apply_platform_patches(); prepare_worker_patches(); "
+        "names={'ops':'vllm_hcu.models.qwen4_exp.common.ops.ple',"
+        "'replacement':'vllm_hcu.models.qwen4_exp.amd.ple_layer'}; "
+        "print(json.dumps({key:value in sys.modules for key,value in names.items()}))"
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout.strip().splitlines()[-1]) == {
+        "ops": False,
+        "replacement": False,
+    }
+
+
+def test_official_ple_fallback_remains_importable():
+    result = _run_fresh(
+        "import importlib,json,os,sys; "
+        "os.environ['VLLM_HCU_USE_CUSTOM_OPS']='0'; "
+        "from vllm_hcu.patch.platform import apply_platform_patches; "
+        "from vllm_hcu.patch.worker import prepare_worker_patches; "
+        "apply_platform_patches(); prepare_worker_patches(); "
+        "module=importlib.import_module('vllm.models.qwen4_exp.amd.ple_layer'); "
+        "model=importlib.import_module('vllm.models.qwen4_exp.amd.model'); "
+        "print(json.dumps({'name':module.__name__,"
+        "'official':not hasattr(module,'_vllm_hcu_qwen4_exp_ple_conv_applied'),"
+        "'model_fused':hasattr(model,'_vllm_hcu_qwen4_exp_fused_ple_applied'),"
+        "'ops_loaded':'vllm_hcu.models.qwen4_exp.common.ops.ple' in sys.modules,"
+        "'replacement_loaded':'vllm_hcu.models.qwen4_exp.amd.ple_layer' in sys.modules}))",
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout.strip().splitlines()[-1]) == {
+        "name": "vllm.models.qwen4_exp.amd.ple_layer",
+        "official": True,
+        "model_fused": False,
+        "ops_loaded": False,
+        "replacement_loaded": False,
     }
 
 

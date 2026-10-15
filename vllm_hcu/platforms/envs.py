@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_FP8_MIXED_BATCH: bool = False
     VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM : bool = False
     VLLM_HCU_USE_CUSTOM_OPS : bool = False
+    VLLM_HCU_GLM53_ROUTER_GEMV: bool = True
     VLLM_HCU_QSA_BACKEND: str = "cutlass"
     VLLM_HCU_USE_CUSTOM_SILU_AND_MUL : bool = False
     VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM : bool = False
@@ -90,6 +91,7 @@ if TYPE_CHECKING:
     VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS: bool = False
     VLLM_HCU_PLE_CPU_OFFLOAD: bool = False
     VLLM_HCU_PLE_PREFETCH_STREAM: bool = False
+    VLLM_HCU_QWEN4_EXP_HC_SP: bool = True
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -123,6 +125,24 @@ def optional_custom_op_enabled(feature_enabled: bool = True) -> bool:
     """
 
     return custom_ops_enabled() and bool(feature_enabled)
+
+
+def qwen4_exp_hc_sp_enabled() -> bool:
+    """Resolve Qwen4Exp HC sequence parallelism under the master switch."""
+
+    return optional_custom_op_enabled(
+        _environment_flag(os.environ.get("VLLM_HCU_QWEN4_EXP_HC_SP", "True"))
+    )
+
+
+def glm53_router_gemv_enabled() -> bool:
+    """Resolve the GLM-5.3 router GEMV under the custom-op master switch."""
+
+    return optional_custom_op_enabled(
+        _environment_flag(
+            os.environ.get("VLLM_HCU_GLM53_ROUTER_GEMV", "True")
+        )
+    )
 
 
 def custom_quantization_gemm_enabled() -> bool:
@@ -174,6 +194,12 @@ def ple_prefetch_enabled() -> bool:
     return custom_ops_enabled() and _environment_flag(
         os.environ.get("VLLM_HCU_PLE_PREFETCH_STREAM", "False")
     )
+
+
+def fused_qwen4_exp_ple_enabled() -> bool:
+    """Select fused Qwen4Exp PLE under the custom-op master switch."""
+
+    return custom_ops_enabled()
 
 
 def fused_qwen3_rms_rope_enabled() -> bool:
@@ -300,6 +326,8 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # If set, control hcu custom unfused or fused kernel ops
     "VLLM_HCU_USE_CUSTOM_OPS":
     custom_ops_enabled,
+    "VLLM_HCU_GLM53_ROUTER_GEMV":
+    glm53_router_gemv_enabled,
     # Select the BF16 QSA implementation independently of the generic
     # FLASH_ATTN backend mode. The BF16 dispatcher applies
     # VLLM_HCU_USE_CUSTOM_OPS as its master gate; FP8 QSA is selected by the
@@ -607,6 +635,13 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # not enable FP8 prefetch.
     "VLLM_HCU_PLE_PREFETCH_STREAM":
         ple_prefetch_enabled,
+
+    # Run Qwen4Exp hyper-connection layers sequence-parallel (attention
+    # all-gather/reduce-scatter instead of all-reduce) when sequence-parallel
+    # MoE is active (DP>1, TP>1, EP). On by default, gated by
+    # VLLM_HCU_USE_CUSTOM_OPS.
+    "VLLM_HCU_QWEN4_EXP_HC_SP":
+        qwen4_exp_hc_sp_enabled,
 
     # gfx938 GLM5Next sparse-indexer K-cache page layout: "preshuffle"
     # (official 16x16 tiles, HCU Triton decode reader) or "normal"
