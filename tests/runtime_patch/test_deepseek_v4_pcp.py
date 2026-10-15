@@ -619,3 +619,47 @@ def test_local_query_capability_gate(monkeypatch, pure_prefill, available, enabl
     )
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
     assert not patch._can_use_local_queries(layer, manager)
+
+
+@pytest.mark.parametrize("pcp_size", [2, 4])
+def test_local_query_runs_cover_local_rows_in_order(pcp_size):
+    batch = _make_batch([(f"r{i}", list(range(i * 16, i * 16 + 16)), 16, True)
+                         for i in range(3)])
+    managers, _ = _make_managers(pcp_size)
+    for manager in managers:
+        manager.partition_batch(batch)
+        rows, local = manager.local_query_rows(0, batch.num_tokens)
+        runs = manager.local_query_runs(0, batch.num_tokens)
+        assert [r for r, _, _ in runs] == [sum(n for *_, n in runs[:i]) for i in range(len(runs))]
+        assert [p for _, start, n in runs for p in range(start, start + n)] == local.tolist()
+        assert manager.local_query_runs(0, batch.num_tokens, max_runs=1) in (None, runs[:1])
+        manager.partition_batch(_make_batch([("next", [1, 2], 2, True)]))
+        assert manager._local_query_runs_cache == {}
+
+
+@pytest.mark.parametrize("runs", [None, ((0, 1, 2), (2, 5, 1))])
+def test_local_prefill_runs_write_local_output_in_place(runs):
+    calls = []
+    def kernel(q, indices, topk_length, output, **_):
+        calls.append(q.shape[0])
+        output.copy_(q * 2 + indices[:, :1, None] + topk_length[:, None, None])
+    selected, local_rows = torch.tensor([1, 3, 6]), torch.tensor([1, 2, 5])
+    manager = SimpleNamespace(local_query_rows=lambda start, end: (selected, local_rows))
+    if runs is not None:
+        manager.local_query_runs = lambda start, end: runs
+    root_q = torch.zeros(8, 2, 4)
+    local_q = torch.randn(6, 2, 4)
+    local_out = torch.full((6, 2, 4), -1.0)
+    indices = torch.arange(8, dtype=torch.float32)[:, None].repeat(1, 3)
+    topk = torch.arange(8, dtype=torch.float32) * 10
+    token = patch._LOCAL_MQA.set((local_q, local_out))
+    try:
+        patch._run_local_prefill(kernel, manager, root_q, 0, q=root_q, indices=indices,
+                                 topk_length=topk, output=root_q)
+    finally:
+        patch._LOCAL_MQA.reset(token)
+    expected = torch.full_like(local_out, -1.0)
+    expected[local_rows] = (local_q[local_rows] * 2 + indices[selected, :1, None]
+                            + topk[selected, None, None])
+    torch.testing.assert_close(local_out, expected)
+    assert calls == ([2, 1] if runs else [3])

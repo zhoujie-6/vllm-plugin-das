@@ -117,15 +117,33 @@ def _run_local_prefill(kernel, manager, root_q, decode_tokens, **kwargs):
         kwargs["output"].zero_()
     if selected.numel() == 0:
         return
+    full_output = kwargs["output"]
+    for name in ("indices", "topk_length"):
+        kwargs[name] = kwargs[name].index_select(0, selected).contiguous()
+    if local_mqa is not None:
+        # Local rows of a request chunk form a few contiguous runs (heads and
+        # tails): let the kernel read and write local Q/output slices in place
+        # instead of gathering Q and scattering the output (~1 ms per call).
+        query_runs = getattr(manager, "local_query_runs", None)
+        runs = None if query_runs is None else query_runs(
+            start + decode_tokens, start + decode_tokens + q.shape[0],
+        )
+        local_q, local_output = local_mqa
+        if runs is not None and local_q.is_contiguous() and local_output.is_contiguous():
+            indices, topk_length = kwargs["indices"], kwargs["topk_length"]
+            for row, local, length in runs:
+                kwargs["q"] = local_q[local:local + length]
+                kwargs["output"] = local_output[local:local + length]
+                kwargs["indices"] = indices[row:row + length]
+                kwargs["topk_length"] = topk_length[row:row + length]
+                kernel(**kwargs)
+            return
     if local_mqa is None:
         local_q = q.index_select(0, selected).contiguous()
     else:
         local_q = local_mqa[0].index_select(0, local_rows).contiguous()
     local_output = torch.empty_like(local_q)
-    full_output = kwargs["output"]
     kwargs["q"] = local_q
-    for name in ("indices", "topk_length"):
-        kwargs[name] = kwargs[name].index_select(0, selected).contiguous()
     kwargs["output"] = local_output
     kernel(**kwargs)
     if local_mqa is None:

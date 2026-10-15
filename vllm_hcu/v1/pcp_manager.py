@@ -135,6 +135,9 @@ class HcuPCPManager:
         self._local_query_rows_cache: dict[
             tuple[int, int], tuple[torch.Tensor, torch.Tensor]
         ] = {}
+        self._local_query_runs_cache: dict[
+            tuple[int, int, int], tuple[tuple[int, int, int], ...] | None
+        ] = {}
         self._padded_num_tokens = 0
         self._local_segments: list[_BatchSegment] = []
         self._global_has_prefill = False
@@ -580,6 +583,7 @@ class HcuPCPManager:
         # Clear on every partition: identical chunk bounds can belong to a
         # different request/layout in the next scheduler iteration.
         self._local_query_rows_cache = {}
+        self._local_query_runs_cache = {}
         num_local_reqs = len(segments)
         num_local_tokens = per_rank_num_tokens[self.pcp_rank]
         num_padded_tokens = self._padded_num_tokens
@@ -1055,6 +1059,33 @@ class HcuPCPManager:
                       self._upload_metadata(local))
             self._local_query_rows_cache[key] = cached
         return cached
+
+    def local_query_runs(
+        self, start: int, end: int, max_runs: int = 8,
+    ) -> tuple[tuple[int, int, int], ...] | None:
+        """Contiguous runs of ``local_query_rows`` as ``(row, local, length)``.
+
+        ``row`` indexes the selected-row order and ``local`` the rank-local
+        position. Lets V4 sparse prefill use local Q/output slices directly
+        instead of gathering Q and scattering the output for every chunk.
+        Returns None when the rows split into more than ``max_runs`` runs.
+        """
+        assert self._local_token_indices_np is not None
+        assert self._local_real_positions_np is not None
+        key = (int(start), int(end), int(max_runs))
+        if key not in self._local_query_runs_cache:
+            owned = self._local_token_indices_np
+            local = self._local_real_positions_np[(owned >= key[0]) & (owned < key[1])]
+            breaks = np.flatnonzero(np.diff(local) != 1) + 1
+            runs = None
+            if local.size and breaks.size < max_runs:
+                bounds = [0, *breaks.tolist(), int(local.size)]
+                runs = tuple(
+                    (begin, int(local[begin]), stop - begin)
+                    for begin, stop in zip(bounds[:-1], bounds[1:])
+                )
+            self._local_query_runs_cache[key] = runs
+        return self._local_query_runs_cache[key]
 
     @property
     def global_batch(self) -> InputBatch:
