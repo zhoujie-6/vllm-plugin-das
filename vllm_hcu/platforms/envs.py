@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES: bool = True
     VLLM_HCU_KV_ZERO_BY_GROUP: bool = True
     VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_SLICES: bool = True
+    VLLM_HCU_DEEPEP_AUTO_SHARED_WEIGHTS: bool = True
     VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH: bool = False
     VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS: bool = False
     VLLM_HCU_PLE_CPU_OFFLOAD: bool = False
@@ -613,6 +614,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_SLICES":
         lambda: _environment_flag(
             os.getenv("VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_SLICES", "1")),
+
+    # DeepEP auto DeepGEMM: keep one routed-expert weight copy for both the
+    # HT (contiguous) and LL (masked) experts when their packers agree.
+    "VLLM_HCU_DEEPEP_AUTO_SHARED_WEIGHTS":
+        lambda: _environment_flag(
+            os.getenv("VLLM_HCU_DEEPEP_AUTO_SHARED_WEIGHTS", "1")),
 
     # Launch shared_experts on the auxiliary stream before routed MoE/DeepEP,
     # and wait only when the shared output is consumed.
