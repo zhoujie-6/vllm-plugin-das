@@ -56,6 +56,29 @@ logger = init_logger("vllm.hcu.deepseek_v4_deepep_experts")
 
 _PACKED_LAYOUT_PROBE_CACHE: dict[tuple[object, ...], bool] = {}
 _PACKED_LAYOUT_PROBE_LOCK = threading.Lock()
+_GFX936_DSPARK_LOGICAL_K = 128
+
+
+@functools.lru_cache(maxsize=1)
+def _current_gfx_arch() -> str:
+    """Return the active HCU architecture without initializing CPU jobs."""
+
+    if not torch.cuda.is_available():
+        return ""
+    try:
+        properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    except (AssertionError, RuntimeError):
+        return ""
+    return str(getattr(properties, "gcnArchName", "")).split(":", 1)[0]
+
+
+def _uses_gfx936_dspark_int8_asm(tensor: torch.Tensor) -> bool:
+    """Select the gfx936 ASM layout that supports DSpark's K=128."""
+
+    return (
+        _current_gfx_arch() == "gfx936"
+        and tensor.size(-1) == _GFX936_DSPARK_LOGICAL_K
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -81,12 +104,14 @@ def marlin_fp8_masked_weight(weight: torch.Tensor) -> torch.Tensor:
     return _deepgemm_op("marlin_fp8_masked_weight")(weight)
 
 
-def marlin_i8_contiguous_weight(weight: torch.Tensor) -> torch.Tensor:
-    return _deepgemm_op("marlin_i8_contiguous_weight")(weight)
+def marlin_i8_contiguous_weight(
+    weight: torch.Tensor, **kwargs
+) -> torch.Tensor:
+    return _deepgemm_op("marlin_i8_contiguous_weight")(weight, **kwargs)
 
 
-def marlin_i8_masked_weight(weight: torch.Tensor) -> torch.Tensor:
-    return _deepgemm_op("marlin_i8_masked_weight")(weight)
+def marlin_i8_masked_weight(weight: torch.Tensor, **kwargs) -> torch.Tensor:
+    return _deepgemm_op("marlin_i8_masked_weight")(weight, **kwargs)
 
 
 def m_grouped_fp8_gemm_nt_contiguous(*args, **kwargs):
@@ -247,9 +272,14 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
         w2: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if getattr(getattr(self, "quant_config", None), "use_int8_w8a8", False):
+            w2_kwargs = (
+                {"shuffle_unique": 0}
+                if _uses_gfx936_dspark_int8_asm(w2)
+                else {}
+            )
             return (
                 marlin_i8_contiguous_weight(w13).detach(),
-                marlin_i8_contiguous_weight(w2).detach(),
+                marlin_i8_contiguous_weight(w2, **w2_kwargs).detach(),
             )
         return (
             marlin_fp8_contiguous_weight(w13).detach(),
@@ -446,11 +476,17 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
         del gateup_output
 
         down_output = _resize_cache(workspace2, (m_aligned, K))
+        down_gemm_kwargs = (
+            {"shuffle_unique": 0}
+            if use_int8 and _uses_gfx936_dspark_int8_asm(q_activation)
+            else {}
+        )
         grouped_gemm(
             (q_activation, q_activation_scale),
             (w2_deepgemm, self.w2_scale),
             down_output,
             m_indices,
+            **down_gemm_kwargs,
         )
 
         deepgemm_unpermute_and_reduce(
@@ -492,7 +528,7 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
         w13: torch.Tensor,
         w2: torch.Tensor,
     ) -> tuple[int, int, int]:
-        if w13.dim() != w2.dim() or w13.dim() not in (6, 7):
+        if w13.dim() not in (6, 7) or w2.dim() not in (3, w13.dim()):
             raise RuntimeError(
                 "DeepEP DeepGEMM weights must be packed before apply(), "
                 f"got w13={tuple(w13.shape)} w2={tuple(w2.shape)}"
@@ -509,13 +545,21 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
             # [E, K / 64, N / 32, 2, 4, 16, 16].
             n = w13.size(2) * w13.size(3) * w13.size(5)
             k = w13.size(1) * w13.size(4) * w13.size(6)
-            w2_n = w2.size(2) * w2.size(3) * w2.size(5)
+            w2_n = (
+                w2.size(1) * 16
+                if w2.dim() == 3
+                else w2.size(2) * w2.size(3) * w2.size(5)
+            )
         else:
             # gfx92a W6 maps [E, N, K] to
             # [E, K / 64, N / 16, 4, 16, 16].
             n = w13.size(2) * w13.size(4)
             k = w13.size(1) * w13.size(3) * w13.size(5)
-            w2_n = w2.size(2) * w2.size(4)
+            w2_n = (
+                w2.size(1) * 16
+                if w2.dim() == 3
+                else w2.size(2) * w2.size(4)
+            )
         if w2_n != k:
             raise RuntimeError(
                 "DeepEP DeepGEMM packed down weight output size does not match "
@@ -590,9 +634,14 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
         w2: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if getattr(getattr(self, "quant_config", None), "use_int8_w8a8", False):
+            w2_kwargs = (
+                {"shuffle_unique": 0}
+                if _uses_gfx936_dspark_int8_asm(w2)
+                else {}
+            )
             return (
                 marlin_i8_masked_weight(w13).detach(),
-                marlin_i8_masked_weight(w2).detach(),
+                marlin_i8_masked_weight(w2, **w2_kwargs).detach(),
             )
         return (
             marlin_fp8_masked_weight(w13).detach(),
@@ -733,12 +782,18 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
         )
 
         out_view = _resize_cache(output, (local_num_experts, max_tokens, K))
+        down_gemm_kwargs = (
+            {"shuffle_unique": 0}
+            if use_int8 and _uses_gfx936_dspark_int8_asm(q_activation)
+            else {}
+        )
         grouped_gemm(
             (q_activation, q_activation_scale),
             (self._deepgemm_w2, self._ensure_ll_weight_scale(self.w2_scale)),
             out_view,
             expert_num_tokens,
             expected_m,
+            **down_gemm_kwargs,
         )
 
     @staticmethod
@@ -832,10 +887,14 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
             None,
         )
         if packed_layout == self.SHARED_LAYOUT:
-            if (
-                layer.w13_weight.dim() in (6, 7)
-                and layer.w2_weight.dim() == layer.w13_weight.dim()
-            ):
+            try:
+                self.ht_experts._packed_deepgemm_problem_shape(
+                    layer.w13_weight,
+                    layer.w2_weight,
+                )
+            except RuntimeError:
+                pass
+            else:
                 self._bind_shared(layer)
                 return
             if not self.ht_experts._can_pack_channel_weights(layer):
@@ -855,10 +914,14 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
                 "_dsv4_channel_deepgemm_masked_w2",
                 None,
             )
-            if (
-                layer.w13_weight.dim() in (6, 7)
-                and layer.w2_weight.dim() == layer.w13_weight.dim()
-            ):
+            try:
+                self.ht_experts._packed_deepgemm_problem_shape(
+                    layer.w13_weight,
+                    layer.w2_weight,
+                )
+            except RuntimeError:
+                pass
+            else:
                 if ll_w13 is None or ll_w2 is None:
                     raise RuntimeError(
                         "DeepEP auto DeepGEMM layer lost its masked weight layout"
@@ -890,9 +953,9 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
         w13 = layer.w13_weight
         w2 = layer.w2_weight
         if _shared_ht_ll_weights_enabled() and self._packers_share_layout(w13, w2):
-            # On gfx938/gfx92a the contiguous and masked packers emit the same
-            # bytes, so one resident copy serves both delegates (and EPLB only
-            # has to move the registered parameters).
+            # When the contiguous and masked packers emit the same bytes, one
+            # resident copy serves both delegates and EPLB only has to move the
+            # registered parameters.
             with torch.no_grad():
                 w13_packed, w2_packed = self.ht_experts._pack_channel_weights(
                     w13, w2

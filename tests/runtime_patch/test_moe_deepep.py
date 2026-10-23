@@ -3446,6 +3446,21 @@ def test_channel_quant_experts_decode_gfx938_pair32_packed_shape():
     ) == (33, 4096, 6144)
 
 
+def test_channel_int8_experts_decode_gfx936_mixed_w6_asm_packed_shape():
+    from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
+        DeepEPDeepGemmContiguousExperts,
+    )
+
+    # DSpark keeps gate/up on W6 and uses the K=128-capable ASM layout for down.
+    w13 = torch.empty((1, 112, 16, 4, 16, 16), device="meta")
+    w2 = torch.empty((1, 448, 2048), device="meta")
+
+    assert DeepEPDeepGemmContiguousExperts._packed_deepgemm_problem_shape(
+        w13,
+        w2,
+    ) == (1, 256, 7168)
+
+
 def test_channel_quant_experts_restore_gfx938_pair32_packed_weights():
     from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
         DeepEPDeepGemmMaskedExperts,
@@ -3498,7 +3513,7 @@ def test_channel_int8_experts_use_int8_deepgemm_weight_layout(
     packed = torch.full((1, 1, 1, 1, 1, 1), 71, dtype=torch.int8)
     calls: list[torch.Tensor] = []
 
-    def int8_packer(weight: torch.Tensor) -> torch.Tensor:
+    def int8_packer(weight: torch.Tensor, **_kwargs) -> torch.Tensor:
         calls.append(weight)
         return packed.clone()
 
@@ -3516,6 +3531,61 @@ def test_channel_int8_experts_use_int8_deepgemm_weight_layout(
     assert calls == [w13, w2]
     assert torch.equal(packed_w13, packed)
     assert torch.equal(packed_w2, packed)
+
+
+@pytest.mark.parametrize(
+    ("experts_name", "packer_name"),
+    (
+        (
+            "DeepEPDeepGemmContiguousExperts",
+            "marlin_i8_contiguous_weight",
+        ),
+        (
+            "DeepEPDeepGemmMaskedExperts",
+            "marlin_i8_masked_weight",
+        ),
+    ),
+)
+def test_gfx936_dspark_int8_down_weight_uses_asm_deepgemm_layout(
+    monkeypatch: pytest.MonkeyPatch,
+    experts_name: str,
+    packer_name: str,
+):
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    experts = object.__new__(getattr(module, experts_name))
+    experts.quant_config = SimpleNamespace(use_int8_w8a8=True)
+    packed = torch.empty((1, 1, 1, 1, 1, 1), dtype=torch.int8)
+    packer_inputs: list[tuple[torch.Tensor, dict[str, object]]] = []
+
+    def record_packer(weight: torch.Tensor, **kwargs) -> torch.Tensor:
+        packer_inputs.append((weight.clone(), kwargs))
+        return packed.clone()
+
+    monkeypatch.setattr(module, "_current_gfx_arch", lambda: "gfx936")
+    monkeypatch.setattr(module, packer_name, record_packer)
+
+    w13 = torch.arange(256 * 64, dtype=torch.int8).view(1, 256, 64)
+    w2 = torch.arange(64 * 128, dtype=torch.int8).view(1, 64, 128)
+    experts._pack_channel_weights(w13, w2)
+
+    assert torch.equal(packer_inputs[0][0], w13)
+    assert packer_inputs[0][1] == {}
+    assert torch.equal(packer_inputs[1][0], w2)
+    assert packer_inputs[1][1] == {"shuffle_unique": 0}
+
+
+def test_dspark_int8_asm_layout_is_gfx936_only(monkeypatch: pytest.MonkeyPatch):
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    monkeypatch.setattr(module, "_current_gfx_arch", lambda: "gfx938")
+    operand = torch.ones((2, 128), dtype=torch.int8)
+
+    assert not module._uses_gfx936_dspark_int8_asm(operand)
 
 
 @pytest.mark.parametrize("use_int8", [False, True])
@@ -3559,6 +3629,7 @@ def test_channel_quant_masked_experts_execute_matching_deepgemm_kernel(
 
     call_number = 0
     expected_m_values: list[int] = []
+    gemm_kwargs: list[dict[str, object]] = []
 
     def public_masked_kernel(
         _a,
@@ -3566,9 +3637,11 @@ def test_channel_quant_masked_experts_execute_matching_deepgemm_kernel(
         destination: torch.Tensor,
         _masked_m,
         expected_m_per_group,
+        **kwargs,
     ) -> torch.Tensor:
         nonlocal call_number
         expected_m_values.append(expected_m_per_group)
+        gemm_kwargs.append(kwargs)
         call_number += 1
         destination.fill_(call_number)
         return destination
@@ -3604,6 +3677,11 @@ def test_channel_quant_masked_experts_execute_matching_deepgemm_kernel(
         else "fuse_silu_mul_fp8_quant_ep"
     )
     monkeypatch.setattr(module, quantizer_name, quantize_activation, raising=False)
+    monkeypatch.setattr(
+        module,
+        "_uses_gfx936_dspark_int8_asm",
+        lambda _tensor: use_int8,
+    )
 
     output = torch.empty((2, 3, 4))
     experts.apply(
@@ -3632,6 +3710,9 @@ def test_channel_quant_masked_experts_execute_matching_deepgemm_kernel(
         [3, 3]
         if use_int8 or not master_enabled
         else [enabled_expected_m, enabled_expected_m]
+    )
+    assert gemm_kwargs == (
+        [{}, {"shuffle_unique": 0}] if use_int8 else [{}, {}]
     )
 
 
@@ -3762,14 +3843,17 @@ def test_channel_quant_contiguous_experts_accept_v0251_permute_contract(
         ),
     )
     call_number = 0
+    gemm_kwargs: list[dict[str, object]] = []
 
     def public_contiguous_kernel(
         _a,
         _b,
         destination: torch.Tensor,
         _m_indices,
+        **kwargs,
     ) -> torch.Tensor:
         nonlocal call_number
+        gemm_kwargs.append(kwargs)
         call_number += 1
         destination.fill_(call_number)
         return destination
@@ -3807,6 +3891,11 @@ def test_channel_quant_contiguous_experts_accept_v0251_permute_contract(
     monkeypatch.setattr(module, quantizer_name, quantize_activation, raising=False)
     monkeypatch.setattr(
         module,
+        "_uses_gfx936_dspark_int8_asm",
+        lambda _tensor: use_int8,
+    )
+    monkeypatch.setattr(
+        module,
         "deepgemm_unpermute_and_reduce",
         lambda a, output, **_kwargs: output.copy_(a),
     )
@@ -3840,6 +3929,9 @@ def test_channel_quant_contiguous_experts_accept_v0251_permute_contract(
 
     assert torch.equal(output, torch.full_like(output, 2))
     assert activation_kwargs["limit"] == 10.0
+    assert gemm_kwargs == (
+        [{}, {"shuffle_unique": 0}] if use_int8 else [{}, {}]
+    )
 
 
 def test_channel_fp8_auto_experts_restore_layouts_after_kernel_recreation(
@@ -3929,6 +4021,36 @@ def test_channel_fp8_auto_experts_restore_layouts_after_kernel_recreation(
     assert torch.equal(reloaded.ht_experts._deepgemm_w2, contiguous)
     assert torch.equal(reloaded.ll_experts._deepgemm_w13, masked)
     assert torch.equal(reloaded.ll_experts._deepgemm_w2, masked)
+
+
+def test_channel_int8_auto_experts_restore_shared_gfx936_mixed_layout():
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as module,
+    )
+
+    experts = object.__new__(module.DeepEPAutoDeepGemmExperts)
+    experts.ht_experts = object.__new__(module.DeepEPDeepGemmContiguousExperts)
+    experts.ll_experts = object.__new__(module.DeepEPDeepGemmMaskedExperts)
+    for child in (experts.ht_experts, experts.ll_experts):
+        child._deepgemm_w13 = None
+        child._deepgemm_w2 = None
+
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(
+        torch.empty((1, 112, 16, 4, 16, 16), device="meta"),
+        requires_grad=False,
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.empty((1, 448, 2048), device="meta"),
+        requires_grad=False,
+    )
+    layer._dsv4_channel_deepgemm_layout = experts.SHARED_LAYOUT
+
+    experts.process_weights_after_loading(layer)
+
+    for child in (experts.ht_experts, experts.ll_experts):
+        assert child._deepgemm_w13 is layer.w13_weight
+        assert child._deepgemm_w2 is layer.w2_weight
 
 
 def test_channel_fp8_auto_experts_isolate_in_place_marlin_layouts(

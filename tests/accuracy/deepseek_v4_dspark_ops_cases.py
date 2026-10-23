@@ -613,6 +613,70 @@ def test_contiguous_channel_int8_deepgemm_matches_dequantized_reference() -> Non
     torch.testing.assert_close(output.float(), reference, rtol=2e-2, atol=1e-2)
 
 
+@pytest.mark.parametrize("layout", ["contiguous", "masked"])
+def test_gfx936_dspark_k128_channel_int8_deepgemm_asm(layout: str) -> None:
+    from vllm_hcu.model_executor.layers.fused_moe.experts import (
+        dpsk_v4_deep_gemm_moe as runtime,
+    )
+
+    device = _hcu_device(allow_gfx936=True)
+    arch = str(torch.cuda.get_device_properties(device).gcnArchName).split(":", 1)[0]
+    if arch != "gfx936":
+        pytest.skip("the K=128 compatibility path is specific to gfx936")
+
+    experts, logical_k, output_size = 1, 128, 7168
+    tokens = 256 if layout == "contiguous" else 8
+    generator = torch.Generator(device=device).manual_seed(746)
+    activation, activation_scale = _channel_int8_quantize(
+        torch.randn((tokens, logical_k), generator=generator, device=device) * 0.1
+    )
+    weight, weight_scale = _channel_int8_quantize(
+        torch.randn(
+            (experts, output_size, logical_k),
+            generator=generator,
+            device=device,
+        )
+        * 0.1
+    )
+    reference_weight = weight.clone()
+    if layout == "contiguous":
+        packed_weight = runtime._deepgemm_op("marlin_i8_contiguous_weight")(
+            weight, shuffle_unique=0
+        )
+        output = torch.empty(
+            (tokens, output_size), device=device, dtype=torch.bfloat16
+        )
+        runtime.m_grouped_i8_gemm_nt_contiguous(
+            (activation, activation_scale),
+            (packed_weight, weight_scale),
+            output,
+            torch.zeros(tokens, device=device, dtype=torch.int32),
+            shuffle_unique=0,
+        )
+    else:
+        packed_weight = runtime._deepgemm_op("marlin_i8_masked_weight")(
+            weight, shuffle_unique=0
+        )
+        output = torch.empty(
+            (experts, tokens, output_size), device=device, dtype=torch.bfloat16
+        )
+        runtime.m_grouped_i8_gemm_nt_masked(
+            (activation.unsqueeze(0), activation_scale.unsqueeze(0)),
+            (packed_weight, weight_scale),
+            output,
+            torch.tensor([tokens], device=device, dtype=torch.int32),
+            tokens,
+            shuffle_unique=0,
+        )
+        output = output[0]
+
+    reference = (activation.float() * activation_scale) @ (
+        reference_weight[0].float() * weight_scale[0]
+    ).T
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output.float(), reference, rtol=2e-2, atol=1e-2)
+
+
 @pytest.mark.parametrize(
     ("hidden", "output_size"),
     ((7168, 4096), (2048, 7168)),
