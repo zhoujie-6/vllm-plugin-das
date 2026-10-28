@@ -4,8 +4,6 @@
 
 from __future__ import annotations
 
-import os
-
 import torch
 
 from vllm.config import get_current_vllm_config
@@ -75,13 +73,13 @@ def validate_config(config, moe, layer, quant_mode=None) -> None:
             "--tensor-parallel-size 1 with data parallel expert parallelism"
         )
     if quant_mode == "int8" and not config.model_config.enforce_eager:
-        raise ValueError("HCU MegaMoE PACK5 adapter requires --enforce-eager")
+        raise ValueError("HCU MegaMoE W4A8 adapter requires --enforce-eager")
     if moe.moe_backend != "deep_gemm_mega_moe":
         raise ValueError(
             "HCU MegaMoE requires --moe-backend deep_gemm_mega_moe"
         )
     if parallel.enable_dbo:
-        raise ValueError("HCU MegaMoE PACK5 does not support DBO")
+        raise ValueError("HCU MegaMoE backend does not support DBO")
     if (
         moe.dp_size > 1
         and getattr(parallel, "all2all_backend", None) == "deepep_low_latency"
@@ -114,7 +112,7 @@ def validate_config(config, moe, layer, quant_mode=None) -> None:
         moe.experts_per_token,
     )
     if shape != (256, 32, 4096, 2048, 6):
-        raise ValueError("HCU MegaMoE PACK5 supports DSV4-Flash EP8 shapes only")
+        raise ValueError("HCU MegaMoE backend supports DSV4-Flash EP8 shapes only")
     if (
         parallel.enable_eplb
         or layer.expert_map_manager.num_fused_shared_experts
@@ -190,14 +188,12 @@ def select_method(layer, quant_config, moe):
         and activation.symmetric
     ):
         raise ValueError("HCU MegaMoE requires symmetric Channel-FP8/dynamic-token FP8")
-    kv_transfer = getattr(config, "kv_transfer_config", None)
-    prefill_only = kv_transfer is not None and kv_transfer.kv_role == "kv_producer"
     graph_tokens = 0
     if not config.model_config.enforce_eager:
         graph_tokens = min(moe.max_num_tokens, moe.max_capture_size)
     return HcuMegaMoEMethod(
         moe, "fp8", weight_quant=weight,
-        graph_tokens=graph_tokens, force_normal=prefill_only or moe.pcp_size > 1,
+        graph_tokens=graph_tokens,
     )
 
 
@@ -225,7 +221,7 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
 
     def __init__(
         self, moe, quant_mode, *, weight_quant=None,
-        graph_tokens=0, force_normal=False,
+        graph_tokens=0,
     ):
         super().__init__(moe)
         self.quant_mode = quant_mode
@@ -237,36 +233,8 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
         self._int4_scales = None
         self._l1 = self._l2 = None
         self._graph_tokens = graph_tokens
-        mode = os.environ.get("MEGAMOE_HCU_BACKEND", "auto").strip().lower()
-        if mode not in ("auto", "ll", "normal"):
-            raise ValueError("MEGAMOE_HCU_BACKEND must be auto, ll or normal")
-        self._mode = "normal" if quant_mode == "int8" or force_normal else mode
-        self._ll_threshold = int(os.environ.get("MEGAMOE_HCU_NORMAL_LL_TOKEN_THRESHOLD", "496"))
-        if self._ll_threshold < 0:
-            raise ValueError("MEGAMOE_HCU_NORMAL_LL_TOKEN_THRESHOLD must be non-negative")
-        self._layout = "normal" if self._mode == "normal" else "unified"
-        # Eager batches above this are split into several MegaMoE calls.
-        self._max_chunk_tokens = max_chunk_tokens(
-            moe, "ll" if self._mode == "ll" else "normal"
-        )
-
-    def _ll_capacity(self):
-        # The wheel sizes LL scratch with its own threshold, which may differ
-        # from the HCU selector. The actual allocation and asm stride bound
-        # take precedence over either tuning threshold.
-        return min(
-            max_chunk_tokens(self.moe, "ll"),
-            int(getattr(self._buffer, "ll_scratch_capacity_tokens_per_rank",
-                        self.moe.max_num_tokens)),
-        )
-
-    def _backend(self, capacity, *, launch_capacity=None):
-        if self._mode == "auto":
-            required = capacity if launch_capacity is None else launch_capacity
-            return "ll" if (
-                capacity <= self._ll_threshold and required <= self._ll_capacity()
-            ) else "normal"
-        return self._mode
+        # DeepGEMM selects LL/HT internally; both use the same W6 layout.
+        self._max_chunk_tokens = max_chunk_tokens(moe, "normal")
 
     @property
     def topk_indices_dtype(self):
@@ -316,35 +284,24 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
         # Loaders write through param.data without advancing Parameter._version.
         # Every post-load call is a refresh boundary, including in-place reloads.
         # No MegaMoE dependency is imported unless the feature was selected.
-        os.environ.setdefault("K3_USE_ASM_TAIL_REDUCE", "0")
         try:
-            import megamoe
+            import deepgemm
         except ModuleNotFoundError as exc:
-            if exc.name != "megamoe":
+            if exc.name != "deepgemm":
                 raise
             raise RuntimeError(
-                "--moe-backend deep_gemm_mega_moe on HCU requires the optional "
-                "standalone megamoe package. Build and install a compatible wheel "
-                "in the serving environment using the DCU/HIP instructions at "
-                "https://github.com/Sherlolo/DeepGEMM-megamoe-w8a8. "
-                "The standard image does not install this package automatically."
+                "HCU MegaMoE requires the installed deepgemm package with "
+                "gfx938 MegaMoE support"
             ) from exc
-
-        required = ["get_symm_buffer_for_mega_moe"]
-        if self.quant_mode == "fp8":
-            required += [
-                ("flatten_pack5_weight_asm_normal"
-                 if self._layout == "normal" else "flatten_pack5_weight"),
-                "cast_to_fp8_channelwise", "fp8_w8a8_mega_moe",
-            ]
-        missing = [
-            name for name in required
-            if not callable(getattr(megamoe, name, None))
-        ]
+        required = (
+            "get_symm_buffer_for_mega_moe", "transform_weights_for_mega_moe",
+            "mega_moe_preprocess", "fp8_mega_moe",
+        )
+        missing = [name for name in required
+                   if not callable(getattr(deepgemm, name, None))]
         if missing:
-            raise RuntimeError(
-                "Incompatible HCU MegaMoE wheel; missing APIs: " + ", ".join(missing)
-            )
+            raise RuntimeError("Installed deepgemm lacks MegaMoE APIs: "
+                               + ", ".join(missing))
         w1, w2 = layer.w13_weight, layer.w2_weight
         if self.quant_mode == "int8":
             from .hcu_int4_megamoe import (
@@ -362,18 +319,9 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
         else:
             if w1.dtype != torch.float8_e4m3fn or w2.dtype != torch.float8_e4m3fn:
                 raise ValueError("HCU MegaMoE requires E4M3FN checkpoint weights")
-            pack = (
-                megamoe.flatten_pack5_weight_asm_normal
-                if self._layout == "normal" else megamoe.flatten_pack5_weight
-            )
-            l1, l2 = tuple(
-                {self._layout: (
-                    pack(w.contiguous()),
-                    s.reshape(w.shape[0], w.shape[1]).float().contiguous(),
-                )}
-                for w, s in (
-                    (w1, layer.w13_weight_scale), (w2, layer.w2_weight_scale)
-                )
+            l1, l2 = deepgemm.transform_weights_for_mega_moe(
+                (w1, layer.w13_weight_scale.reshape(w1.shape[:2]).float().contiguous()),
+                (w2, layer.w2_weight_scale.reshape(w2.shape[:2]).float().contiguous()),
             )
         max_tokens = int(self.moe.max_num_tokens)
         ep = get_ep_group()
@@ -391,10 +339,10 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
             self.moe.hidden_dim, self.moe.intermediate_size_per_partition,
         )
         if key not in cache:
-            kwargs = {"quant_mode": "int8"} if self.quant_mode == "int8" else {}
+            kwargs = {}
             if self._graph_tokens:
                 kwargs["cuda_graph_max_tokens_per_rank"] = self._graph_tokens
-            cache[key] = megamoe.get_symm_buffer_for_mega_moe(
+            cache[key] = deepgemm.get_symm_buffer_for_mega_moe(
                 group, self.moe.num_experts, max_tokens,
                 self.moe.experts_per_token, self.moe.hidden_dim,
                 self.moe.intermediate_size_per_partition,
@@ -402,21 +350,17 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
                 **kwargs,
             )
         self._buffer = cache[key]
-        if self.quant_mode == "int8" and getattr(self._buffer, "quant_mode", None) != "int8":
-            raise RuntimeError("MegaMoE factory did not create an INT8 symmetric buffer")
-        if self._graph_tokens and getattr(self._buffer, "cuda_graph_num_tokens", None) is None:
-            raise RuntimeError("MegaMoE wheel does not provide graph token buffers")
         if self.quant_mode == "fp8" and self._l1 is not None:
             # Graphs hold addresses, not Python attributes. Refresh packed
             # weights/scales in place so reload cannot leave replay on stale
-            # copies while eager uses the newly assigned dictionaries.
+            # copies while eager uses newly assigned tuples.
             for old, new in ((self._l1, l1), (self._l2, l2)):
-                for dst, src in zip(old[self._layout], new[self._layout]):
+                for dst, src in zip(old, new):
                     if dst.shape != src.shape or dst.dtype != src.dtype or dst.device != src.device:
                         raise ValueError("MegaMoE weight reload changed packed tensor geometry")
             with torch.no_grad():
                 for old, new in ((self._l1, l1), (self._l2, l2)):
-                    for dst, src in zip(old[self._layout], new[self._layout]):
+                    for dst, src in zip(old, new):
                         dst.copy_(src)
             l1, l2 = self._l1, self._l2
         if self.quant_mode == "int8":
@@ -430,15 +374,13 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
             self._warmup_graph(layer)
 
     def _warmup_graph(self, layer):
-        """Compile graph-specific native launches before CUDA capture starts."""
-        import megamoe
+        """Initialize native launches before capture; replay uses padded routes."""
+        import deepgemm
 
-        buf = self._buffer
         if self._graph_tokens > self._max_chunk_tokens:
-            raise ValueError("MegaMoE CUDA graph bucket exceeds K1/K3 stride capacity")
-        if self._mode == "ll" and self._graph_tokens > self._ll_capacity():
-            raise ValueError("MegaMoE CUDA graph bucket exceeds LL scratch/stride capacity")
-        key = (self._layout, self._mode, self._graph_tokens, layer.swiglu_limit)
+            raise ValueError("MegaMoE CUDA graph bucket exceeds stride capacity")
+        buf = self._buffer
+        key = (self.quant_mode, self._graph_tokens, layer.swiglu_limit)
         warmed = getattr(buf, "_hcu_megamoe_graph_warmups", None)
         if warmed is None:
             warmed = buf._hcu_megamoe_graph_warmups = set()
@@ -448,39 +390,25 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
         buf.x_sf.fill_(1)
         buf.topk_idx.fill_(-1)
         buf.topk_weights.zero_()
-        buf.cuda_graph_num_tokens.zero_()
-        y = torch.empty(
-            (self._graph_tokens, self.moe.hidden_dim),
-            dtype=torch.bfloat16, device=buf.x.device,
+        y = torch.empty((self._graph_tokens, self.moe.hidden_dim),
+                        dtype=torch.bfloat16, device=buf.x.device)
+        deepgemm.fp8_mega_moe(
+            y, self._l1, self._l2, buf,
+            activation_clamp=layer.swiglu_limit, fast_math=True,
         )
-        if self._mode == "auto":
-            backends = (
-                ("ll", "normal")
-                if self._graph_tokens <= self._ll_capacity() else ("normal",)
-            )
-        else:
-            backends = (self._mode,)
-        for backend in backends:
-            megamoe.fp8_w8a8_mega_moe(
-                y, self._l1, self._l2, buf,
-                megamoe_backend=backend, graph=True,
-                capacity_num_tokens=self._graph_tokens,
-                activation_clamp=layer.swiglu_limit,
-                cumulative_local_expert_recv_stats=None, fast_math=True,
-            )
         warmed.add(key)
 
     def apply(
         self, layer, x, topk_weights, topk_ids,
         shared_experts=None, shared_experts_input=None,
     ):
-        import megamoe
+        import deepgemm
 
         if self._buffer is None:
             raise RuntimeError("HCU MegaMoE weights/buffer were not initialized")
         capturing = torch.cuda.is_current_stream_capturing()
         if capturing and self.quant_mode == "int8":
-            raise RuntimeError("HCU MegaMoE PACK5 adapter requires eager execution")
+            raise RuntimeError("HCU MegaMoE W4A8 adapter requires eager execution")
         if x.ndim != 2 or x.dtype != torch.bfloat16:
             raise ValueError("HCU MegaMoE requires BF16 hidden states")
         if (
@@ -528,8 +456,6 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
         if capacity == 0:
             return y
         buf = self._buffer
-        if graph and getattr(buf, "cuda_graph_num_tokens", None) is None:
-            raise RuntimeError("MegaMoE wheel does not provide graph token buffers")
         l1, l2 = self._l1, self._l2
         if self.quant_mode == "int8":
             from .hcu_int4_megamoe import int4_w4a8_mega_moe
@@ -540,13 +466,11 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
             l2 = {"raw_int4": (layer.w2_weight, s2)}
             run = int4_w4a8_mega_moe
         else:
-            run = megamoe.fp8_w8a8_mega_moe
+            run = deepgemm.fp8_mega_moe
         # K1/K3 asm strides are uint32, so large eager batches run as several
         # MegaMoE calls. Chunking follows the shared capacity, so every EP/DP
         # rank issues the same number of collective calls.
         chunk = self._max_chunk_tokens
-        if self._mode == "ll":
-            chunk = min(chunk, self._ll_capacity())
         if graph:
             if capacity > chunk:
                 raise ValueError(
@@ -561,39 +485,16 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
             # non-empty step. -1 is MegaMoE's unused-expert sentinel.
             buf.topk_idx.fill_(-1)
             buf.topk_weights.zero_()
-            if graph:
-                # Capture the padded bucket size as a GPU operation. Every replay
-                # executes this update; another target/draft bucket cannot leave a
-                # stale host-provided count in the shared symmetric buffer.
-                buf.cuda_graph_num_tokens.fill_(n)
             if m:
-                xs, ids, ws = x[lo:hi], topk_ids[lo:hi], topk_weights[lo:hi]
-                if self.quant_mode == "int8":
-                    megamoe.mega_moe_pre_dispatch_int8(
-                        xs.contiguous(), ids.contiguous(), ws.contiguous(),
-                        buf.x, buf.x_sf, buf.topk_idx, buf.topk_weights, m,
-                    )
-                else:
-                    q, scale = megamoe.cast_to_fp8_channelwise(xs.contiguous())
-                    buf.x[:m].copy_(q)
-                    buf.x_sf[:m].copy_(scale.reshape(-1))
-                    buf.topk_idx[:m].copy_(ids)
-                    buf.topk_weights[:m].copy_(ws)
-            descriptor = getattr(context, "batch_descriptor", None)
-            selector = (
-                getattr(descriptor, "num_tokens", capacity) if graph
-                else chunk_capacity
-            )
-            if graph and self.moe.dp_size > 1:
-                # Local graph buckets can differ across DP ranks. Pin selection
-                # to the shared maximum graph capacity so captured collectives
-                # agree regardless of which local buckets are replayed together.
-                selector = capacity
+                deepgemm.mega_moe_preprocess(
+                    x[lo:hi].contiguous(), topk_ids[lo:hi].contiguous(),
+                    topk_weights[lo:hi].contiguous(), buf, m,
+                    is_int8=self.quant_mode == "int8",
+                )
+            # The native entry takes its local token count from y. A padded
+            # graph bucket is safe because unused routes above are -1/zero.
             run(
                 y if graph else y[lo:hi], l1, l2, buf,
-                megamoe_backend=self._backend(selector, launch_capacity=chunk_capacity),
-                graph=graph, capacity_num_tokens=chunk_capacity,
-                activation_clamp=layer.swiglu_limit,
-                cumulative_local_expert_recv_stats=None, fast_math=True,
+                activation_clamp=layer.swiglu_limit, fast_math=True,
             )
         return y[:n] if graph else y

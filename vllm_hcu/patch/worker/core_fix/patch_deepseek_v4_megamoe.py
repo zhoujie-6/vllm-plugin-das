@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Select the opt-in MegaMoE method before fallback kernel construction.
 
-On HCU, ``--moe-backend deep_gemm_mega_moe`` selects the standalone megamoe
+On HCU, ``--moe-backend deep_gemm_mega_moe`` selects the installed deepgemm
 package instead of vLLM's NVIDIA DeepGEMM MegaMoE path. Other backends
 retain their existing selection logic.
 """

@@ -20,8 +20,24 @@ def load_file(monkeypatch, name, path):
     return module
 
 
+def fake_deepgemm():
+    fake = ModuleType("deepgemm")
+    fake.transform_weights_for_mega_moe = lambda a, b: (
+        tuple(t.clone() for t in a), tuple(t.clone() for t in b))
+    fake.fp8_mega_moe = lambda *args, **kwargs: None
+    fake.get_symm_buffer_for_mega_moe = lambda *args, **kwargs: NS()
+    def preprocess(x, ids, weights, buf, rows, is_int8=False):
+        buf.x[:rows].copy_(x)
+        buf.x_sf[:rows].fill_(2)
+        buf.topk_idx[:rows].copy_(ids)
+        buf.topk_weights[:rows].copy_(weights)
+    fake.mega_moe_preprocess = preprocess
+    return fake
+
+
 @pytest.fixture
 def runtime(monkeypatch):
+    monkeypatch.setitem(sys.modules, "deepgemm", fake_deepgemm())
     class Base:
         def __init__(self, moe):
             self.moe = moe
@@ -140,10 +156,10 @@ def test_fp8_idle_dp_rank_participates_and_clears_stale_routes(runtime, monkeypa
     method._buffer = buf
     method._l1, method._l2 = object(), object()
     calls = []
-    fake = ModuleType("megamoe")
-    fake.fp8_w8a8_mega_moe = lambda *args, **kwargs: calls.append((args, kwargs))
+    fake = fake_deepgemm()
+    fake.fp8_mega_moe = lambda *args, **kwargs: calls.append((args, kwargs))
     fake.cast_to_fp8_channelwise = lambda x: (x, torch.ones(x.shape[0]))
-    monkeypatch.setitem(sys.modules, "megamoe", fake)
+    monkeypatch.setitem(sys.modules, "deepgemm", fake)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(runtime, "get_forward_context", lambda: NS(
         dp_metadata=NS(num_tokens_across_dp_cpu=torch.tensor([0, 7]))))
@@ -151,7 +167,7 @@ def test_fp8_idle_dp_rank_participates_and_clears_stale_routes(runtime, monkeypa
     result = method.apply(layer, x, torch.empty(0, 6), torch.empty(0, 6, dtype=torch.int64))
     assert result.shape == x.shape
     assert len(calls) == 1
-    assert calls[0][1]["capacity_num_tokens"] == 7
+    assert calls[0][0][0].shape[0] == 0
     assert calls[0][1]["activation_clamp"] == 10.
     assert (buf.topk_idx == -1).all() and (buf.topk_weights == 0).all()
 
@@ -165,7 +181,7 @@ def test_pcp_defensively_ignores_injected_dp_metadata(
 ):
     _, moe, layer = valid_config()
     moe.pcp_size = 8
-    method = runtime.HcuMegaMoEMethod(moe, "fp8", force_normal=True)
+    method = runtime.HcuMegaMoEMethod(moe, "fp8")
     buf = NS(
         topk_idx=torch.ones(16, 6, dtype=torch.int64),
         topk_weights=torch.ones(16, 6),
@@ -174,14 +190,14 @@ def test_pcp_defensively_ignores_injected_dp_metadata(
     )
     method._buffer, method._l1, method._l2 = buf, {}, {}
     calls = []
-    fake = ModuleType("megamoe")
+    fake = fake_deepgemm()
     fake.cast_to_fp8_channelwise = lambda x: (
         x.float(), torch.ones(x.shape[0], 1)
     )
-    fake.fp8_w8a8_mega_moe = (
-        lambda *args, **kwargs: calls.append(kwargs)
+    fake.fp8_mega_moe = (
+        lambda *args, **kwargs: calls.append((args, kwargs))
     )
-    monkeypatch.setitem(sys.modules, "megamoe", fake)
+    monkeypatch.setitem(sys.modules, "deepgemm", fake)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     # Synthetic defensive input: the supported TP1/DP1/PCP8 builders do not
     # create DP metadata, even when passed an unsplit token count.
@@ -194,8 +210,8 @@ def test_pcp_defensively_ignores_injected_dp_metadata(
     )
 
     assert len(calls) == 1
-    assert calls[0]["capacity_num_tokens"] == 2
-    assert calls[0]["megamoe_backend"] == "normal"
+    assert calls[0][0][0].shape[0] == 2
+    assert "megamoe_backend" not in calls[0][1]
 
 
 def test_fp8_stages_routes_and_scales(runtime, monkeypatch):
@@ -204,12 +220,12 @@ def test_fp8_stages_routes_and_scales(runtime, monkeypatch):
     buf = NS(topk_idx=torch.ones(16, 6, dtype=torch.int64),
              topk_weights=torch.ones(16, 6), x=torch.empty(16, 4096), x_sf=torch.empty(16))
     method._buffer, method._l1, method._l2 = buf, {}, {}
-    fake = ModuleType("megamoe")
+    fake = fake_deepgemm()
     fake.cast_to_fp8_channelwise = lambda x: (x.float(), torch.full((x.shape[0], 1), 2.))
     def run(y, *args, **kwargs):
         y.fill_(3)
-    fake.fp8_w8a8_mega_moe = run
-    monkeypatch.setitem(sys.modules, "megamoe", fake)
+    fake.fp8_mega_moe = run
+    monkeypatch.setitem(sys.modules, "deepgemm", fake)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     x = torch.ones(2, 4096, dtype=torch.bfloat16)
     ids = torch.arange(12).reshape(2, 6)
@@ -247,14 +263,14 @@ def test_fp8_large_batch_is_chunked_on_every_dp_rank(runtime, monkeypatch):
              topk_weights=torch.ones(16, 6), x=torch.empty(16, 4096), x_sf=torch.empty(16))
     method._buffer, method._l1, method._l2 = buf, {}, {}
     calls = []
-    fake = ModuleType("megamoe")
+    fake = fake_deepgemm()
     fake.cast_to_fp8_channelwise = lambda x: (x.float(), torch.ones(x.shape[0], 1))
     def run(y, *args, **kwargs):
         m = y.shape[0]
-        calls.append((m, kwargs["capacity_num_tokens"], buf.topk_idx[:, 0].clone()))
+        calls.append((m, buf.topk_idx[:, 0].clone()))
         y.copy_(buf.x[:m])
-    fake.fp8_w8a8_mega_moe = run
-    monkeypatch.setitem(sys.modules, "megamoe", fake)
+    fake.fp8_mega_moe = run
+    monkeypatch.setitem(sys.modules, "deepgemm", fake)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(runtime, "get_forward_context", lambda: NS(
         dp_metadata=NS(num_tokens_across_dp_cpu=torch.tensor([6, 10]))))
@@ -263,9 +279,9 @@ def test_fp8_large_batch_is_chunked_on_every_dp_rank(runtime, monkeypatch):
     result = method.apply(layer, x, torch.ones(6, 6), ids)
     torch.testing.assert_close(result, x)
     # Shared capacity 10 -> 4+4+2 calls; this rank has 4, 2, then 0 tokens.
-    assert [(m, cap) for m, cap, _ in calls] == [(4, 4), (2, 4), (0, 2)]
-    assert calls[1][2][:3].tolist() == [4, 5, -1]  # Stale routes cleared.
-    assert (calls[2][2] == -1).all()
+    assert [m for m, _ in calls] == [4, 2, 0]
+    assert calls[1][1][:3].tolist() == [4, 5, -1]  # Stale routes cleared.
+    assert (calls[2][1] == -1).all()
 
 
 @pytest.mark.parametrize("inference", [False, True])
@@ -278,17 +294,17 @@ def test_post_load_reuses_buffer_and_invalidates_weight_cache(runtime, monkeypat
                   w2_weight=nn.Parameter(torch.zeros(2, 4, 4, dtype=torch.float8_e4m3fn), requires_grad=False),
                   w13_weight_scale=nn.Parameter(torch.ones(2, 8, 1), requires_grad=False),
                   w2_weight_scale=nn.Parameter(torch.ones(2, 4, 1), requires_grad=False))
-    fake = ModuleType("megamoe")
+    fake = fake_deepgemm()
     calls = []
     fake.flatten_pack5_weight_asm_normal = lambda w: w.clone()
     fake.flatten_pack5_weight = lambda w: w.clone()
     fake.cast_to_fp8_channelwise = lambda x: (x, torch.ones(x.shape[0]))
-    fake.fp8_w8a8_mega_moe = lambda *args, **kwargs: None
+    fake.fp8_mega_moe = lambda *args, **kwargs: None
     def factory(*args, **kwargs):
         calls.append(kwargs)
         return object()
     fake.get_symm_buffer_for_mega_moe = factory
-    monkeypatch.setitem(sys.modules, "megamoe", fake)
+    monkeypatch.setitem(sys.modules, "deepgemm", fake)
     group = object()
     ep = NS(device_group=group)
     monkeypatch.setattr(runtime, "get_ep_group", lambda: ep)
@@ -299,7 +315,7 @@ def test_post_load_reuses_buffer_and_invalidates_weight_cache(runtime, monkeypat
     a.process_weights_after_loading(weights)
     original = a._l1
     addresses = [t.data_ptr() for packed in (a._l1, a._l2)
-                 for t in packed["unified"]]
+                 for t in packed]
     # Real loaders write via .data, leaving Parameter version counters unchanged.
     version = None if inference else weights.w13_weight._version
     weights.w13_weight.data.copy_(torch.ones_like(weights.w13_weight))
@@ -309,10 +325,10 @@ def test_post_load_reuses_buffer_and_invalidates_weight_cache(runtime, monkeypat
         assert weights.w13_weight._version == version
     a.process_weights_after_loading(weights)
     for packed in (a._l1, a._l2):
-        assert (packed["unified"][0].float() == 1).all()
-    assert (a._l1["unified"][1] == 3).all()
+        assert (packed[0].float() == 1).all()
+    assert (a._l1[1] == 3).all()
     assert addresses == [t.data_ptr() for packed in (a._l1, a._l2)
-                         for t in packed["unified"]]
+                         for t in packed]
     a.process_weights_after_loading(weights)
     assert a._l1 is original
     # Explicit post-load refresh also covers ordinary in-place scale updates.
@@ -320,7 +336,7 @@ def test_post_load_reuses_buffer_and_invalidates_weight_cache(runtime, monkeypat
         weights.w13_weight_scale.fill_(2)
     a.process_weights_after_loading(weights)
     assert a._l1 is original  # Graph-safe reload preserves captured addresses.
-    assert (a._l1["unified"][1] == 2).all()
+    assert (a._l1[1] == 2).all()
     b.process_weights_after_loading(layer())
     assert a._buffer is b._buffer and len(calls) == 1
 
@@ -404,41 +420,6 @@ def test_config_rejects_fused_shared_experts(runtime):
         runtime.validate_config(config, moe, layer)
 
 
-@pytest.mark.parametrize("layout", ["raw_int4", "normal_int4"])
-def test_int4_adapter_reuses_scratch_across_layers_and_separates_streams(int4, monkeypatch, layout):
-    fake = ModuleType("megamoe")
-    calls = []
-    def run(y, l1, l2, buf, **kwargs):
-        calls.append((l1, l2, kwargs))
-        return y
-    fake.int8_mega_moe = run
-    monkeypatch.setitem(sys.modules, "megamoe", fake)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    stream = NS(cuda_stream=1)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: stream)
-    def unpack(p, out):
-        raw = p.to(torch.int16)
-        values = torch.stack((raw >> 4, raw & 15), -1)
-        out.copy_(((values ^ 8)-8).to(torch.int8).reshape(out.shape))
-    monkeypatch.setattr(int4, "unpack_raw_int4_pack5_out", unpack)
-    monkeypatch.setattr(int4, "unpack_signed_int4_out", unpack)
-    scale = torch.ones(1, 8)
-    l1 = {layout: (torch.full((1, 1, 8), 0x8F, dtype=torch.uint8), scale)}
-    l2 = {layout: (torch.full((1, 1, 4), 0x17, dtype=torch.uint8), scale)}
-    buf = NS(quant_mode="int8")
-    y = torch.empty(2, 4)
-    int4.int4_w4a8_mega_moe(y, l1, l2, buf, capacity_num_tokens=2)
-    scratch = calls[-1][0]["normal"][0]
-    torch.testing.assert_close(scratch, torch.tensor([[-8, -1]*8], dtype=torch.int8))
-    int4.int4_w4a8_mega_moe(y, l1, l2, buf)
-    assert calls[-1][0]["normal"][0] is scratch
-    stream.cuda_stream = 2
-    int4.int4_w4a8_mega_moe(y, l1, l2, buf)
-    assert calls[-1][0]["normal"][0] is not scratch
-    with pytest.raises(NotImplementedError, match="eager"):
-        int4.int4_w4a8_mega_moe(y, l1, l2, buf, graph=True)
-    with pytest.raises(NotImplementedError, match="normal"):
-        int4.int4_w4a8_mega_moe(y, l1, l2, buf, megamoe_backend="ll")
 
 
 def test_selects_slimquant_before_fallback_construction(runtime, monkeypatch):
@@ -491,44 +472,10 @@ def test_selects_channel_fp8_and_rejects_mismatched_projections(runtime, monkeyp
         runtime.select_method(layer, quant, moe)
 
 
-def test_fp8_graph_has_fixed_workspace_and_updates_token_count(runtime, monkeypatch):
-    _, moe, layer = valid_config()
-    method = runtime.HcuMegaMoEMethod(moe, "fp8", graph_tokens=8)
-    buf = NS(topk_idx=torch.ones(16, 6, dtype=torch.int64),
-             topk_weights=torch.ones(16, 6), x=torch.empty(16, 4096),
-             x_sf=torch.empty(16), cuda_graph_num_tokens=torch.tensor([99]))
-    method._buffer, method._l1, method._l2 = buf, {}, {}
-    fake = ModuleType("megamoe")
-    fake.cast_to_fp8_channelwise = lambda x: (x.float(), torch.ones(x.shape[0]))
-    calls = []
-    def run(y, *args, **kwargs):
-        calls.append((y.shape, kwargs, int(buf.cuda_graph_num_tokens[0])))
-        y.fill_(4)
-    fake.fp8_w8a8_mega_moe = run
-    monkeypatch.setitem(sys.modules, "megamoe", fake)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    monkeypatch.setattr(runtime, "get_forward_context", lambda: NS(
-        dp_metadata=object(), batch_descriptor=NS(num_tokens=2)))
-    x = torch.ones(2, 4096, dtype=torch.bfloat16)
-    out = method.apply(layer, x, torch.ones(2, 6), torch.zeros(2, 6, dtype=torch.int64))
-    assert out.shape == x.shape and (out == 4).all()
-    shape, kwargs, tokens = calls[-1]
-    assert shape == (8, 4096) and tokens == 2
-    assert kwargs["graph"] and kwargs["capacity_num_tokens"] == 8
-    assert kwargs["megamoe_backend"] == "ll"
-    assert (buf.topk_idx[2:] == -1).all()
-    buf.cuda_graph_num_tokens.fill_(99)
-    method.apply(layer, x, torch.ones(2, 6), torch.zeros(2, 6, dtype=torch.int64))
-    assert calls[-1][2] == 2
 
 
-def test_backend_selection_and_pcp_guard(runtime, monkeypatch):
+def test_pcp_requires_dp1_and_eager(runtime, monkeypatch):
     config, moe, layer = valid_config()
-    monkeypatch.setenv("MEGAMOE_HCU_NORMAL_LL_TOKEN_THRESHOLD", "4")
-    fp8 = runtime.HcuMegaMoEMethod(moe, "fp8")
-    assert fp8._backend(4) == "ll" and fp8._backend(5) == "normal"
-    assert runtime.HcuMegaMoEMethod(moe, "int8")._backend(1) == "normal"
-    assert runtime.HcuMegaMoEMethod(moe, "fp8", force_normal=True)._backend(1) == "normal"
     moe.pcp_size = 2
     runtime.validate_config(config, moe, layer)
     moe.dp_size = 2
@@ -545,7 +492,7 @@ def test_dp_requires_exact_coordinated_counts(runtime, monkeypatch):
     moe.dp_size = 2
     method = runtime.HcuMegaMoEMethod(moe, "fp8")
     method._buffer = object()
-    monkeypatch.setitem(sys.modules, "megamoe", ModuleType("megamoe"))
+    monkeypatch.setitem(sys.modules, "deepgemm", fake_deepgemm())
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     x = torch.ones(3, 4096, dtype=torch.bfloat16)
     weights, ids = torch.ones(3, 6), torch.zeros(3, 6, dtype=torch.int64)
@@ -591,56 +538,10 @@ def test_other_models_bypass_feature_even_when_global_switch_is_on(runtime, monk
     assert runtime.select_method(layer, None, moe) is None
 
 
-def test_old_int8_factory_is_rejected_before_allocation(int4, monkeypatch):
-    fake = ModuleType("megamoe")
-    fake.int8_mega_moe = fake.mega_moe_pre_dispatch_int8 = lambda *a, **kw: None
-    class SymmBuffer:
-        def __init__(self, *, quant_mode):
-            pass
-    fake.SymmBuffer = SymmBuffer
-    fake.get_symm_buffer_for_mega_moe = lambda group: None
-    monkeypatch.setitem(sys.modules, "megamoe", fake)
-    with pytest.raises(RuntimeError, match="get_symm_buffer_for_mega_moe"):
-        int4.validate_megamoe_int8_runtime()
 
 
-@pytest.mark.parametrize("dtype", [torch.uint8, torch.int8])
-def test_raw_int4_pack5_triton_on_hcu(int4, dtype):
-    try:
-        torch.cuda.init()
-    except RuntimeError as exc:
-        pytest.skip(f"requires HCU to execute the unpack kernel: {exc}")
-    e, n, k = 2, 256, 256
-    raw = torch.arange(e*n*k//2).to(dtype).reshape(e, n, k//2)
-    cpu = raw.to(torch.int16)
-    values = ((torch.stack(((cpu >> 4) & 15, cpu & 15), -1) ^ 8)-8).to(torch.int8)
-    reference = values.reshape(e, n//256, 16, 16, k//64, 4, 16)
-    reference = reference.permute(0, 4, 1, 2, 5, 3, 6).contiguous().reshape(e, n*k)
-    out = torch.empty((e, n*k), dtype=torch.int8, device="cuda")
-    int4.unpack_raw_int4_pack5_out(raw.to("cuda"), out)
-    torch.testing.assert_close(out.cpu(), reference)
 
 
-@pytest.mark.parametrize("ll_capacity,backends", [(16, ["ll", "normal"]), (4, ["normal"])])
-def test_graph_warmup_is_per_buffer_and_before_capture(runtime, monkeypatch, ll_capacity, backends):
-    _, moe, layer = valid_config()
-    method = runtime.HcuMegaMoEMethod(moe, "fp8", graph_tokens=8)
-    method._l1, method._l2 = {}, {}
-    buf = NS(x=torch.ones(16, 4096), x_sf=torch.ones(16),
-             topk_idx=torch.ones(16, 6, dtype=torch.int64),
-             topk_weights=torch.ones(16, 6), cuda_graph_num_tokens=torch.tensor([99]))
-    buf.ll_scratch_capacity_tokens_per_rank = ll_capacity
-    method._buffer = buf
-    fake = ModuleType("megamoe")
-    calls = []
-    fake.fp8_w8a8_mega_moe = lambda *args, **kwargs: calls.append(kwargs)
-    monkeypatch.setitem(sys.modules, "megamoe", fake)
-    method._warmup_graph(layer)
-    method._warmup_graph(layer)
-    assert [c["megamoe_backend"] for c in calls] == backends
-    assert all(c["graph"] and c["capacity_num_tokens"] == 8 for c in calls)
-    assert buf.cuda_graph_num_tokens.item() == 0
-    assert (buf.topk_idx == -1).all()
 
 
 def test_pcp_runner_keeps_rank_local_tokens_for_megamoe():
@@ -705,41 +606,8 @@ def test_offload_sleep_and_nonstandard_activation_rejected(runtime):
         runtime.validate_config(config, moe, layer)
 
 
-@pytest.mark.parametrize("e,n,k", [(1, 256, 64), (2, 512, 256)])
-@pytest.mark.parametrize("dtype", [torch.uint8, torch.int8])
-def test_raw_pack5_kernel_interpreter_matches_independent_layout(int4, e, n, k, dtype):
-    # Execute the production Triton indexing on host pointers. Unlike a
-    # mirrored Python implementation, this also exercises tl.load/store,
-    # signed-byte shifts and every PACK5 block/expert boundary without a GPU.
-    from triton.runtime.interpreter import InterpretedFunction
-    raw = torch.arange(e*n*k//2).to(torch.uint8).view(dtype).reshape(e, n, k//2)
-    out = torch.empty((e, n*k), dtype=torch.int8)
-    kernel = InterpretedFunction(int4._unpack_raw_int4_pack5.fn)
-    kernel[(int4.triton.cdiv(out.numel(), 2048),)](
-        raw, out, out.numel(), n, k, 2048, num_warps=4)
-    byte = raw.to(torch.int16)
-    values = ((torch.stack(((byte >> 4) & 15, byte & 15), -1) ^ 8)-8).to(torch.int8)
-    reference = values.reshape(e, n//256, 16, 16, k//64, 4, 16)
-    reference = reference.permute(0, 4, 1, 2, 5, 3, 6).contiguous().reshape(e, n*k)
-    torch.testing.assert_close(out, reference)
 
 
-@pytest.mark.parametrize("backend", ["auto", "ll"])
-def test_ll_selection_respects_native_scratch_and_stride(runtime, monkeypatch, backend):
-    _, moe, _ = valid_config()
-    monkeypatch.setenv("MEGAMOE_HCU_BACKEND", backend)
-    method = runtime.HcuMegaMoEMethod(moe, "fp8")
-    method._buffer = NS(ll_scratch_capacity_tokens_per_rank=4)
-    assert method._ll_capacity() == 4
-    if backend == "auto":
-        assert method._backend(4) == "ll"
-        assert method._backend(5) == "normal"
-        # A small graph bucket still launches with the buffer's graph maximum.
-        assert method._backend(2, launch_capacity=8) == "normal"
-    monkeypatch.setattr(runtime, "max_chunk_tokens", lambda *args: 2)
-    assert method._ll_capacity() == 2
-    if backend == "auto":
-        assert method._backend(3) == "normal"
 
 
 @pytest.mark.parametrize("owns_dispatch,expected", [(True, False), (False, True)])
@@ -766,45 +634,8 @@ def test_ep_fused_combine_excludes_backend_owned_dispatch(owns_dispatch, expecte
     assert runner._ep_fused_combine is expected
 
 
-@pytest.mark.parametrize("mode,match", [("normal", "stride"), ("ll", "LL scratch")])
-def test_graph_warmup_rejects_unsafe_capacity_before_launch(runtime, monkeypatch, mode, match):
-    _, moe, layer = valid_config()
-    monkeypatch.setenv("MEGAMOE_HCU_BACKEND", mode)
-    method = runtime.HcuMegaMoEMethod(moe, "fp8", graph_tokens=8)
-    method._buffer = NS(ll_scratch_capacity_tokens_per_rank=4)
-    if mode == "normal":
-        method._max_chunk_tokens = 4
-    monkeypatch.setitem(sys.modules, "megamoe", ModuleType("megamoe"))
-    with pytest.raises(ValueError, match=match):
-        method._warmup_graph(layer)
 
 
-def test_int4_pack5_matches_expanded_int8_permutation_and_scales(int4):
-    # Independent signed-nibble reference: use every possible byte, including
-    # negative int8 bytes. Verify unpacking commutes with PACK5 permutation.
-    e, h, i = 2, 256, 256
-    w1 = torch.arange(e * 2 * i * h // 2).to(torch.uint8).reshape(e, 2*i, h//2)
-    w2 = torch.arange(e * h * i // 2).to(torch.uint8).reshape(e, h, i//2)
-    s1, s2 = torch.rand(e, 2*i, 1), torch.rand(e, h, 1)
-    l1, l2 = int4.transform_int4_weights_for_mega_moe_normal(
-        w1, w2, l1_scale=s1, l2_scale=s2)
-
-    def expand(w):
-        nibbles = torch.stack((w.to(torch.int16) >> 4, w.to(torch.int16) & 15), -1)
-        return ((nibbles ^ 8) - 8).to(torch.int8).reshape(*w.shape[:-1], w.shape[-1]*2)
-
-    for w, scale, packed in ((w1, s1, l1), (w2, s2, l2)):
-        values, scales = packed["normal_int4"]
-        raw = expand(w)
-        _, n, k = raw.shape
-        reference = raw.reshape(e, n//256, 16, 16, k//64, 4, 16)
-        reference = reference.permute(0, 4, 1, 2, 5, 3, 6).contiguous().reshape(e, n*k)
-        torch.testing.assert_close(expand(values), reference)
-        torch.testing.assert_close(scales, scale.squeeze(-1)*16)
-        assert values.numel() == w.numel()
-        assert scales.dtype == torch.float32
-    _, true_scales = int4._pack(w1, s1, 1.0)["normal_int4"]
-    torch.testing.assert_close(true_scales, s1.squeeze(-1))
 
 
 def test_signed_int4_triton_unpack_on_hcu(int4):
@@ -874,9 +705,9 @@ def test_int4_native_layerwise_reload_releases_temporary_weights(runtime, int4, 
     native = importlib.import_module(package.__name__ + ".layerwise")
     monkeypatch.setattr(runtime, "__package__", package.__name__)
     monkeypatch.setitem(sys.modules, package.__name__ + ".hcu_int4_megamoe", int4)
-    fake = ModuleType("megamoe")
+    fake = fake_deepgemm()
     fake.get_symm_buffer_for_mega_moe = lambda *args, **kwargs: NS(quant_mode="int8")
-    monkeypatch.setitem(sys.modules, "megamoe", fake)
+    monkeypatch.setitem(sys.modules, "deepgemm", fake)
     monkeypatch.setattr(int4, "validate_megamoe_int8_runtime", lambda: None)
     monkeypatch.setattr(runtime, "get_ep_group", lambda: NS(device_group=object()))
     monkeypatch.setattr(runtime.HcuMegaMoEMethod, "get_fused_moe_quant_config", lambda *args: None)
@@ -921,7 +752,7 @@ def test_int4_native_layerwise_reload_releases_temporary_weights(runtime, int4, 
     method._buffer.topk_weights = torch.zeros(16, 6)
     method._buffer.x = torch.empty(16, 4096)
     method._buffer.x_sf = torch.empty(16)
-    fake.mega_moe_pre_dispatch_int8 = lambda *args: None
+    fake.mega_moe_preprocess = lambda *args, **kwargs: None
     seen = []
     def run(y, l1, l2, *args, **kwargs):
         assert l1["raw_int4"][0] is canonical["w13_weight"]
@@ -935,33 +766,6 @@ def test_int4_native_layerwise_reload_releases_temporary_weights(runtime, int4, 
     assert seen == [True]
 
 
-@pytest.mark.parametrize("capturing", [True, False])
-@pytest.mark.parametrize("threshold,expected", [(4, "normal"), (8, "ll")])
-def test_dp_graph_uses_same_backend_for_uneven_local_buckets(runtime, monkeypatch, capturing, threshold, expected):
-    monkeypatch.setenv("MEGAMOE_HCU_BACKEND", "auto")
-    monkeypatch.setenv("MEGAMOE_HCU_NORMAL_LL_TOKEN_THRESHOLD", str(threshold))
-    fake = ModuleType("megamoe")
-    fake.cast_to_fp8_channelwise = lambda x: (x.float(), torch.ones(x.shape[0]))
-    backends = []
-    fake.fp8_w8a8_mega_moe = lambda *args, **kwargs: backends.append(kwargs["megamoe_backend"])
-    monkeypatch.setitem(sys.modules, "megamoe", fake)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
-    for rank, tokens in enumerate((2, 6)):
-        _, moe, layer = valid_config()
-        moe.dp_size, moe.dp_rank = 2, rank
-        method = runtime.HcuMegaMoEMethod(moe, "fp8", graph_tokens=8)
-        method._buffer = NS(topk_idx=torch.ones(16, 6, dtype=torch.int64),
-                            topk_weights=torch.ones(16, 6), x=torch.empty(16, 4096),
-                            x_sf=torch.empty(16), cuda_graph_num_tokens=torch.tensor([0]),
-                            ll_scratch_capacity_tokens_per_rank=16)
-        method._l1, method._l2 = {}, {}
-        context = NS(dp_metadata=NS(num_tokens_across_dp_cpu=torch.tensor([2, 6])),
-                     batch_descriptor=NS(num_tokens=tokens),
-                     cudagraph_runtime_mode=NS(name="FULL"))
-        monkeypatch.setattr(runtime, "get_forward_context", lambda: context)
-        method.apply(layer, torch.ones(tokens, 4096, dtype=torch.bfloat16),
-                     torch.ones(tokens, 6), torch.zeros(tokens, 6, dtype=torch.int64))
-    assert backends == [expected, expected]
 
 
 @pytest.mark.parametrize("dp_size,backend,auto,rejected", [
@@ -982,32 +786,6 @@ def test_config_rejects_dp_backend_without_token_metadata(runtime, dp_size, back
         runtime.validate_config(config, moe, layer)
 
 
-@pytest.mark.parametrize("missing", ["megamoe", "megamoe_native_dependency"])
-def test_optional_megamoe_import_error(runtime, monkeypatch, missing):
-    import builtins
-    original_import = builtins.__import__
-    imports = []
-    def import_without_megamoe(name, *args, **kwargs):
-        if name == "megamoe":
-            imports.append(name)
-            raise ModuleNotFoundError(f"No module named {missing!r}", name=missing)
-        return original_import(name, *args, **kwargs)
-    monkeypatch.setattr(builtins, "__import__", import_without_megamoe)
-    _, moe, _ = valid_config()
-    method = runtime.HcuMegaMoEMethod(moe, "fp8")
-    assert imports == []  # No import before explicit MegaMoE weight finalization.
-    if missing == "megamoe":
-        with pytest.raises(RuntimeError, match="optional standalone megamoe") as exc:
-            method.process_weights_after_loading(None)
-        assert "--moe-backend deep_gemm_mega_moe" in str(exc.value)
-        assert "Build and install" in str(exc.value)
-        assert "https://github.com/Sherlolo/DeepGEMM-megamoe-w8a8" in str(exc.value)
-        assert isinstance(exc.value.__cause__, ModuleNotFoundError)
-    else:
-        # Preserve errors inside an installed package instead of claiming it is absent.
-        with pytest.raises(ModuleNotFoundError) as exc:
-            method.process_weights_after_loading(None)
-        assert exc.value.name == missing
 
 
 def _native_context_symbols():
@@ -1098,3 +876,167 @@ def test_pcp_metadata_from_actual_context_builders(runtime, monkeypatch, builder
             # supported MegaMoE configuration and must not be sent to apply.
             assert context.dp_metadata.num_tokens_across_dp_cpu.tolist() == [2, 7]
     assert contexts == []
+
+
+@pytest.mark.parametrize("interleave", [False, True])
+@pytest.mark.parametrize("e,n,k", [(1,32,64),(2,256,128),(2,512,256)])
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.int8])
+def test_raw_w6_kernel_matches_independent_layout(int4, interleave, e, n, k, dtype):
+    from triton.runtime.interpreter import InterpretedFunction
+    raw = torch.arange(e*n*k//2).to(torch.uint8).view(dtype).reshape(e,n,k//2)
+    out = torch.empty((e,k//64,n//16,4,16,16), dtype=torch.int8)
+    kernel = InterpretedFunction(int4._unpack_raw_int4_w6.fn)
+    kernel[(int4.triton.cdiv(out.numel(),2048),)](
+        raw,out,out.numel(),n,k,interleave,2048,num_warps=4)
+    byte = raw.to(torch.int16)
+    ref = (((torch.stack(((byte >> 4)&15, byte&15),-1)^8)-8)
+           .to(torch.int8).reshape(e,n,k))
+    if interleave:
+        ref = torch.stack((ref[:,:n//2].reshape(e,n//16,8,k),
+                           ref[:,n//2:].reshape(e,n//16,8,k)),2).reshape(e,n,k)
+    ref = ref.reshape(e,n//16,16,k//64,4,16).permute(0,3,1,4,2,5).contiguous()
+    torch.testing.assert_close(out,ref)
+
+
+@pytest.mark.parametrize("capturing", [False,True])
+def test_deepgemm_graph_uses_padded_output_and_clears_routes(runtime,monkeypatch,capturing):
+    _,moe,layer=valid_config()
+    method=runtime.HcuMegaMoEMethod(moe,"fp8",graph_tokens=8)
+    buf=NS(topk_idx=torch.ones(16,6,dtype=torch.int64),topk_weights=torch.ones(16,6),
+           x=torch.empty(16,4096),x_sf=torch.empty(16))
+    method._buffer,method._l1,method._l2=buf,(),()
+    fake=sys.modules["deepgemm"]
+    calls=[]
+    def run(y,*args,**kwargs):
+        calls.append((y.shape,kwargs,buf.topk_idx.clone()))
+        y.fill_(4)
+    fake.fp8_mega_moe=run
+    monkeypatch.setattr(torch.cuda,"is_current_stream_capturing",lambda:capturing)
+    monkeypatch.setattr(runtime,"get_forward_context",lambda:NS(
+        dp_metadata=None,cudagraph_runtime_mode=NS(name="FULL")))
+    for n in (6,2):
+        x=torch.ones(n,4096,dtype=torch.bfloat16)
+        y=method.apply(layer,x,torch.ones(n,6),torch.zeros(n,6,dtype=torch.int64))
+        assert y.shape==x.shape and (y==4).all()
+        shape,kwargs,ids=calls[-1]
+        assert shape==(8,4096)
+        assert kwargs==dict(activation_clamp=10.,fast_math=True)
+        assert (ids[n:]==-1).all()
+
+
+def test_deepgemm_graph_warmup_cached_and_does_not_need_old_token_buffer(runtime,monkeypatch):
+    _,moe,layer=valid_config()
+    method=runtime.HcuMegaMoEMethod(moe,"fp8",graph_tokens=8)
+    buf=NS(topk_idx=torch.ones(16,6,dtype=torch.int64),topk_weights=torch.ones(16,6),
+           x=torch.empty(16,4096),x_sf=torch.empty(16))
+    method._buffer,method._l1,method._l2=buf,(),()
+    calls=[]
+    sys.modules["deepgemm"].fp8_mega_moe=lambda *args,**kwargs:calls.append(args)
+    method._warmup_graph(layer)
+    method._warmup_graph(layer)
+    assert len(calls)==1 and calls[0][0].shape==(8,4096)
+    assert (buf.topk_idx==-1).all()
+    method._max_chunk_tokens=4
+    with pytest.raises(ValueError,match="stride capacity"):
+        method._warmup_graph(layer)
+
+
+@pytest.mark.parametrize("missing",["deepgemm","deepgemm_native_dependency"])
+def test_deepgemm_import_failure_is_actionable_and_preserves_inner_error(runtime,monkeypatch,missing):
+    import builtins
+    original=builtins.__import__
+    def importing(name,*args,**kwargs):
+        if name=="megamoe":
+            pytest.fail("must never import standalone megamoe")
+        if name=="deepgemm":
+            raise ModuleNotFoundError(name=missing)
+        return original(name,*args,**kwargs)
+    monkeypatch.setattr(builtins,"__import__",importing)
+    _,moe,_=valid_config()
+    method=runtime.HcuMegaMoEMethod(moe,"fp8")
+    if missing=="deepgemm":
+        with pytest.raises(RuntimeError,match="installed deepgemm"):
+            method.process_weights_after_loading(None)
+    else:
+        with pytest.raises(ModuleNotFoundError) as exc:
+            method.process_weights_after_loading(None)
+        assert exc.value.name==missing
+
+
+def test_deepgemm_missing_mega_api_fails_before_weight_allocation(runtime,monkeypatch):
+    _,moe,_=valid_config()
+    del sys.modules["deepgemm"].mega_moe_preprocess
+    with pytest.raises(RuntimeError,match="mega_moe_preprocess"):
+        runtime.HcuMegaMoEMethod(moe,"fp8").process_weights_after_loading(None)
+
+
+def test_w4a8_uses_deepgemm_int8_and_reuses_stream_scratch(int4,monkeypatch):
+    fake=fake_deepgemm()
+    calls=[]
+    fake.fp8_mega_moe=lambda *a,**kw:calls.append((a,kw))
+    monkeypatch.setitem(sys.modules,"deepgemm",fake)
+    monkeypatch.setattr(torch.cuda,"is_current_stream_capturing",lambda:False)
+    stream=NS(cuda_stream=1)
+    monkeypatch.setattr(torch.cuda,"current_stream",lambda *a:stream)
+    unpacked=[]
+    def unpack(p,out,**kw):
+        unpacked.append(kw.get("interleave",False))
+        out.fill_(1)
+    monkeypatch.setattr(int4,"unpack_raw_int4_w6_out",unpack)
+    p1,p2=torch.zeros(2,512,128,dtype=torch.int8),torch.zeros(2,256,128,dtype=torch.int8)
+    s1,s2=torch.arange(1024.).reshape(2,512),torch.ones(2,256)
+    l1,l2={"raw_int4":(p1,s1)},{"raw_int4":(p2,s2)}
+    y,buf=torch.empty(1,256,dtype=torch.bfloat16),NS()
+    for _ in range(2):
+        int4.int4_w4a8_mega_moe(y,l1,l2,buf,activation_clamp=10.)
+    assert len(buf._int4_unpack_workspaces)==1
+    assert calls[0][0][1][0] is calls[1][0][1][0]
+    assert unpacked==[True,False,True,False]
+    assert calls[0][1]==dict(is_int8=True,activation_clamp=10.)
+    expected=torch.stack((s1[:,:256].reshape(2,32,8),s1[:,256:].reshape(2,32,8)),2).reshape(2,512)
+    torch.testing.assert_close(calls[0][0][1][1],expected)
+    def unavailable(*a,**kw):
+        raise RuntimeError("MegaMoE INT8 kernels not compiled (DG_MEGA_BUILD_INT8=0)")
+    fake.fp8_mega_moe=unavailable
+    with pytest.raises(RuntimeError,match="DG_MEGA_BUILD_INT8=1") as exc:
+        int4.int4_w4a8_mega_moe(y,l1,l2,buf)
+    assert "INT8 kernels not compiled" in str(exc.value.__cause__)
+    fake.fp8_mega_moe=lambda *a,**kw:None
+    stream.cuda_stream=2
+    int4.int4_w4a8_mega_moe(y,l1,l2,buf)
+    assert len(buf._int4_unpack_workspaces)==2
+    monkeypatch.setattr(torch.cuda,"is_current_stream_capturing",lambda:True)
+    with pytest.raises(NotImplementedError,match="eager"):
+        int4.int4_w4a8_mega_moe(y,l1,l2,buf)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires HCU")
+@pytest.mark.parametrize("interleave",[False,True])
+def test_raw_w6_gpu_matches_installed_deepgemm(int4,interleave):
+    import deepgemm
+    from deepgemm.m_group_gemm import pack_int8_weight_w6_ll
+    # A few hundred KiB, no IPC allocation or model weights.
+    e,n,k=2,256,128
+    raw=torch.arange(e*n*k//2,device="cuda").to(torch.uint8).reshape(e,n,k//2)
+    b=raw.to(torch.int16)
+    unpacked=(((torch.stack(((b>>4)&15,b&15),-1)^8)-8).to(torch.int8).reshape(e,n,k))
+    if interleave:
+        from deepgemm.mega.mega_moe import interleave_gate_up_weights
+        unpacked=interleave_gate_up_weights(unpacked)
+    reference=pack_int8_weight_w6_ll(unpacked.contiguous().clone())
+    out=torch.empty_like(reference)
+    int4.unpack_raw_int4_w6_out(raw,out,interleave=interleave)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out,reference)
+    assert "/site-packages/deepgemm/" in deepgemm.__file__
+
+
+def test_runtime_has_no_standalone_megamoe_import():
+    import ast
+    for name in ("megamoe_runtime.py","hcu_int4_megamoe.py"):
+        path=REPO/"vllm_hcu/model_executor/layers/fused_moe"/name
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node,ast.Import):
+                assert all(n.name.split(".")[0]!="megamoe" for n in node.names)
+            if isinstance(node,ast.ImportFrom):
+                assert (node.module or "").split(".")[0]!="megamoe"
