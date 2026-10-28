@@ -430,14 +430,17 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         method = _require_hcu_pcp_attribute(
             speculative_config, "method", "SpeculativeConfig"
         )
-        if method != "mtp":
+        dspark_pcp = is_deepseek_v4(vllm_config) and method == "dspark"
+        if method != "mtp" and not dspark_pcp:
             raise ValueError("GLM-5.2 PCP only supports built-in MTP.")
         num_speculative_tokens = _require_hcu_pcp_attribute(
             speculative_config,
             "num_speculative_tokens",
             "SpeculativeConfig",
         )
-        if num_speculative_tokens not in (1, 2, 3):
+        if dspark_pcp and num_speculative_tokens < 1:
+            raise ValueError("DeepSeek V4 PCP+DSpark requires positive draft tokens.")
+        if not dspark_pcp and num_speculative_tokens not in (1, 2, 3):
             raise ValueError(
                 "GLM-5.2 PCP+MTP requires one to three speculative tokens."
             )
