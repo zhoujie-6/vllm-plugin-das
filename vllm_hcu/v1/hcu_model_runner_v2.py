@@ -27,7 +27,7 @@ from vllm_hcu.forward_context_runtime import (
 from vllm_hcu.patch.config import get_hcu_config
 from vllm_hcu.v1.pcp_manager import make_hcu_pcp_manager_cls
 from vllm_hcu.patch.platform.core_fix.patch_vllm_config import is_glm53_pcp
-from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4
+from vllm_hcu.deepseek_v4_runtime import is_deepseek_v4, is_dspark_enabled
 
 
 def _uses_global_pcp_batch(vllm_config) -> bool:
@@ -686,9 +686,22 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             and execute_model_state is not None
             and not getattr(self, "is_last_pp_rank", True)
         )
+        if use_replicated_mtp_batch and is_dspark_enabled(self.vllm_config):
+            # DSpark conditions on intermediate target layers. These rows use
+            # the same PCP layout as the final hidden states; restore each
+            # layer before the drafter combines them in global request order.
+            aux_hidden_states = execute_model_state.aux_hidden_states
+            if aux_hidden_states:
+                execute_model_state = execute_model_state._replace(
+                    aux_hidden_states=[
+                        self.pcp_manager.restore_hidden_states(hidden)
+                        for hidden in aux_hidden_states
+                    ],
+                )
         if (
             use_replicated_mtp_batch
             and is_deepseek_v4(self.vllm_config)
+            and not is_dspark_enabled(self.vllm_config)
             and execute_model_state.hidden_states is not None
         ):
             # Native V4 MTP reads the pre-hc residual through the model getter,
