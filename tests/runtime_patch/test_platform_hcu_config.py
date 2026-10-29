@@ -2398,13 +2398,15 @@ def test_sparse_cache_normalization_tolerates_missing_attention_config(
     assert config.cache_config.cache_dtype == "fp8_e4m3"
 
 
+@pytest.mark.parametrize("dspark", [False, True])
 @pytest.mark.parametrize(
     "parallel_dimension",
     ["prefill_context_parallel_size", "decode_context_parallel_size"],
 )
-def test_deepep_auto_platform_final_graph_policy_disables_piecewise(
+def test_deepep_auto_platform_final_graph_policy_scopes_pcp_dspark(
     monkeypatch: pytest.MonkeyPatch,
     parallel_dimension: str,
+    dspark: bool,
 ) -> None:
     from vllm.config.compilation import CUDAGraphMode
     from vllm_hcu.patch.import_coordinator import IMPORT_COORDINATOR
@@ -2420,7 +2422,9 @@ def test_deepep_auto_platform_final_graph_policy_disables_piecewise(
             pcp=2,
             dp=1,
             enable_expert_parallel=True,
-            enforce_eager=True,
+            enforce_eager=not dspark,
+            speculative=dspark,
+            speculative_method="dspark",
             all2all_backend="deepep_low_latency",
             moe_backend="auto",
         )
@@ -2459,7 +2463,10 @@ def test_deepep_auto_platform_final_graph_policy_disables_piecewise(
 
     HCUPlatform.check_and_update_config(config)
 
-    assert config.compilation_config.cudagraph_mode is CUDAGraphMode.NONE
+    expected = (CUDAGraphMode.FULL_DECODE_ONLY
+                if dspark and parallel_dimension == "prefill_context_parallel_size"
+                else CUDAGraphMode.NONE)
+    assert config.compilation_config.cudagraph_mode is expected
 
 
 def test_sparse_flashmla_sets_engine_cache_block_size_before_worker_start(
