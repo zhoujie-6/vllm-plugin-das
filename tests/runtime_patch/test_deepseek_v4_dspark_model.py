@@ -334,3 +334,75 @@ def test_dspark_context_insert_normalizes_non_uint8_cache_before_upstream(
     assert passed_kv is normalized_kv
     assert passed_positions is positions
     assert passed_slots is slot_mapping
+
+
+def test_dspark_eplb_registers_all_draft_layers(dspark_module, monkeypatch):
+    from vllm.model_executor.models.interfaces import get_mixture_of_experts_model
+    events = []
+
+    class MoE:
+        n_logical_experts = n_routed_experts = 256
+        n_physical_experts = 320
+        n_local_physical_experts = 40
+        n_shared_experts = 1
+        n_redundant_experts = 64
+        def __init__(self, index):
+            self.experts = SimpleNamespace(
+                get_expert_weights=lambda: [index],
+                set_eplb_state=lambda **kw: events.append((index, kw)),
+                update_expert_map=lambda: events.append(("update", index)),
+            )
+
+    amd = ModuleType("vllm.models.deepseek_v4.amd.model")
+    amd.DeepseekV4MoE = MoE
+    monkeypatch.setitem(sys.modules, amd.__name__, amd)
+    cls = dspark_module.DSparkDeepseekV4ForCausalLM
+    model = cls.__new__(cls)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(n_group=8)
+    model.model = SimpleNamespace(layers=[
+        SimpleNamespace(ffn=MoE(i)) for i in range(3)
+    ])
+    model.set_moe_parameters()
+    assert get_mixture_of_experts_model(model) is model
+    assert model.num_moe_layers == 3
+    assert model.num_physical_experts == 320
+    load, mapping, replicas = object(), object(), object()
+    model.set_eplb_state(load, mapping, replicas)
+    assert model.expert_weights == [[0], [1], [2]]
+    for i, (index, kw) in enumerate(events):
+        assert index == kw["moe_layer_idx"] == i
+        assert kw["expert_load_view"] is load
+        assert kw["logical_to_physical_map"] is mapping
+        assert kw["logical_replica_count"] is replicas
+    model.update_physical_experts_metadata(320, 40)
+    assert events[-3:] == [("update", i) for i in range(3)]
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_dspark_eplb_loader_uses_private_redundant_mapping(
+    dspark_module, monkeypatch, fail,
+):
+    def mapping(*args, **kwargs):
+        return kwargs
+    namespace = {"fused_moe_make_expert_params_mapping": mapping}
+    exec("def load_weights(self, weights):\n"
+         "    result = fused_moe_make_expert_params_mapping(self, num_experts=256)\n"
+         "    if weights: raise RuntimeError('load failed')\n"
+         "    return result\n", namespace)
+    upstream = dspark_module._dspark.DSparkDeepseekV4ForCausalLM
+    monkeypatch.setattr(upstream, "load_weights", namespace["load_weights"], raising=False)
+    cls = dspark_module.DSparkDeepseekV4ForCausalLM
+    model = cls.__new__(cls)
+    nn.Module.__init__(model)
+    model._hcu_enable_eplb = True
+    model.num_redundant_experts = 64
+    if fail:
+        with pytest.raises(RuntimeError, match="load failed"):
+            model.load_weights([1])
+    else:
+        assert model.load_weights([]) == {
+            "num_experts": 256, "num_redundant_experts": 64,
+        }
+    assert namespace["load_weights"].__globals__["fused_moe_make_expert_params_mapping"] is mapping
+    assert not model._loading_dspark_weights

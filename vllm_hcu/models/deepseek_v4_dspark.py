@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import torch
+from types import FunctionType
 
 from vllm.model_executor.layers.mhc import HCHeadOp
 from vllm.models.deepseek_v4.nvidia import dspark as _dspark
@@ -247,6 +248,35 @@ class DSparkDeepseekV4ForCausalLM(_dspark.DSparkDeepseekV4ForCausalLM):
             self.config.vocab_size
         )
 
+        self._hcu_enable_eplb = getattr(vllm_config.parallel_config, "enable_eplb", False)
+        if self._hcu_enable_eplb:
+            self.set_moe_parameters()
+
+    def set_moe_parameters(self):
+        from vllm.models.deepseek_v4.amd.model import DeepseekV4MoE
+        from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_eplb import _collect_moe
+
+        type(self)._vllm_hcu_moe_cls = DeepseekV4MoE
+        _collect_moe(self)
+
+    def set_eplb_state(self, expert_load_view, logical_to_physical_map,
+                       logical_replica_count):
+        from vllm.model_executor.models.interfaces import MixtureOfExperts
+
+        return MixtureOfExperts.set_eplb_state(
+            self, expert_load_view, logical_to_physical_map, logical_replica_count,
+        )
+
+    def update_physical_experts_metadata(self, num_physical_experts,
+                                         num_local_physical_experts):
+        from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_eplb import (
+            _update_physical_experts_metadata,
+        )
+
+        return _update_physical_experts_metadata(
+            self, num_physical_experts, num_local_physical_experts,
+        )
+
     def _finalize_moe(self) -> None:
         for layer in self.model.layers:
             ffn = layer.ffn
@@ -276,6 +306,23 @@ class DSparkDeepseekV4ForCausalLM(_dspark.DSparkDeepseekV4ForCausalLM):
     def load_weights(self, weights):
         self._loading_dspark_weights = True
         try:
-            return super().load_weights(weights)
+            if not getattr(self, "_hcu_enable_eplb", False):
+                return super().load_weights(weights)
+            # Use the upstream loader with a private globals namespace: include
+            # redundant expert mappings without rebinding the NVIDIA module.
+            original = _dspark.DSparkDeepseekV4ForCausalLM.load_weights
+            mapping = original.__globals__["fused_moe_make_expert_params_mapping"]
+
+            def make_mapping(*args, **kwargs):
+                kwargs["num_redundant_experts"] = self.num_redundant_experts
+                return mapping(*args, **kwargs)
+
+            namespace = dict(original.__globals__)
+            namespace["fused_moe_make_expert_params_mapping"] = make_mapping
+            loader = FunctionType(
+                original.__code__, namespace, original.__name__,
+                original.__defaults__, original.__closure__,
+            )
+            return loader(self, weights)
         finally:
             self._loading_dspark_weights = False
