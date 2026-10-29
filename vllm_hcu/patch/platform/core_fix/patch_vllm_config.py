@@ -665,11 +665,16 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
         if (
             getattr(parallel_config, "enable_eplb", False)
             and feature_config.expert_map_path is None
+            # Record-only calibration skips weight transfers and map commits.
+            and not (
+                feature_config.expert_map_record_path is not None
+                and feature_config.eplb_disable_rearrange
+            )
         ):
             raise ValueError(
                 "deepep_auto with EPLB is not supported because the HT and "
                 "LL expert weight layouts cannot be rebalanced atomically; "
-                "use a static expert_map_path instead"
+                "use a static expert_map_path or expert_map_record_path with disable_rearrange=true instead"
             )
         # Only V4 restores global prefill phase evidence for PCP-only auto.
         # Its native MTP draft runs against the restored global target batch.

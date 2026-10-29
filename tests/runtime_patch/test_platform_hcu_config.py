@@ -3121,3 +3121,19 @@ def test_engine_args_skip_list_covers_every_master_resolved_field():
         "dp_int8_allgather",
     }
     assert skip_list == persisted
+
+
+@pytest.mark.parametrize("disable_rearrange", [False, True])
+def test_deepep_auto_record_only_calibration(disable_rearrange):
+    config = _validation_config(HcuFeatureConfig(
+        deepep_auto=True, expert_map_record_path="/tmp/calibration.json",
+        eplb_disable_rearrange=disable_rearrange))
+    config.parallel_config.all2all_backend = "deepep_low_latency"
+    config.parallel_config.enable_eplb = True
+    config.parallel_config.data_parallel_size = 8
+    config.parallel_config.enable_expert_parallel = True
+    if disable_rearrange:
+        patch_vllm_config.validate_and_update_hcu_config(config)
+    else:
+        with pytest.raises(ValueError, match="deepep_auto.*EPLB.*not supported"):
+            patch_vllm_config.validate_and_update_hcu_config(config)
