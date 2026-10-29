@@ -919,7 +919,7 @@ def test_deepgemm_graph_uses_padded_output_and_clears_routes(runtime,monkeypatch
         y=method.apply(layer,x,torch.ones(n,6),torch.zeros(n,6,dtype=torch.int64))
         assert y.shape==x.shape and (y==4).all()
         shape,kwargs,ids=calls[-1]
-        assert shape==(8,4096)
+        assert shape==(n,4096)
         assert kwargs==dict(activation_clamp=10.,fast_math=True)
         assert (ids[n:]==-1).all()
 

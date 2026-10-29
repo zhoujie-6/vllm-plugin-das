@@ -434,8 +434,11 @@ class HcuMegaMoEMethod(FusedMoEMethodBase):
         if self.moe.pcp_size > 1:
             metadata = None
         if graph:
-            capacity = self._graph_tokens
-            if capacity <= 0 or n > capacity:
+            # Native DeepGEMM reads launch rows from y. Each graph bucket
+            # already has a static padded input shape; launching the maximum
+            # capture capacity here wastes GEMM/dispatch work for small decode.
+            capacity = n
+            if self._graph_tokens <= 0 or n > self._graph_tokens:
                 raise ValueError("MegaMoE CUDA graph bucket exceeds configured capacity")
         elif metadata is None:
             if getattr(self.moe, "dp_size", 1) > 1:
