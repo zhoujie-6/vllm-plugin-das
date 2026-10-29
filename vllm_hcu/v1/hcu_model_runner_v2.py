@@ -340,6 +340,11 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             raise RuntimeError(
                 "official MRV2 did not initialize the selected HCU PCP manager"
             )
+        if (_uses_global_pcp_batch(self.vllm_config)
+                and is_dspark_enabled(self.vllm_config)):
+            from vllm_hcu.v1.deepseek_v4_pcp_graph import install_decode_dispatch
+
+            install_decode_dispatch(self)
         self._init_host_seq_lens()
 
     # ------------------------------------------------------------------
@@ -667,6 +672,32 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 block_table[:, 0].copy_(state_slots)
         slot_mappings = self.pcp_manager.get_dummy_slot_mappings(input_batch.num_tokens)
         return block_tables, slot_mappings
+
+    def gather_batch_req_state(self, scheduler_output, dummy_run=False):
+        result = super().gather_batch_req_state(scheduler_output, dummy_run)
+        if _uses_global_pcp_batch(self.vllm_config) and is_dspark_enabled(self.vllm_config):
+            state = result[0]
+            # Dispatch precedes partition_batch(): use request-level global
+            # phase, including short prefills matching a decode graph shape.
+            self._hcu_pcp_graph_has_prefill = (
+                state is not None and bool(state.is_prefilling_np.any())
+            )
+        return result
+
+    def capture_model(self, *, profile_only=False):
+        if not (_uses_global_pcp_batch(self.vllm_config)
+                and is_dspark_enabled(self.vllm_config)):
+            return super().capture_model(profile_only=profile_only)
+        # Decode replicas consume the runner's original global input buffers.
+        # Capturing through PCP's local dummy buffers/expanded slots would bake
+        # different addresses from the metadata rebuilt for real decode.
+        manager = self.pcp_manager
+        self.pcp_manager = None
+        try:
+            with replicated_mtp_batch_scope():
+                return super().capture_model(profile_only=profile_only)
+        finally:
+            self.pcp_manager = manager
 
     def sample_tokens(self, grammar_output):
         execute_model_state = self.execute_model_state

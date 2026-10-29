@@ -418,7 +418,16 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     if use_mla and not _require_hcu_pcp_attribute(
         model_config, "enforce_eager", "ModelConfig"
     ):
-        raise ValueError("GLM-5.2 PCP requires eager execution without graphs.")
+        if not (is_deepseek_v4(vllm_config) and is_dspark_enabled(vllm_config)):
+            raise ValueError("GLM-5.2 PCP requires eager execution without graphs.")
+        # PCP prefill has dynamic query ownership and KV gathers. Only the
+        # replicated decode layout can replay a full target graph.
+        from vllm.config.compilation import CompilationMode, CUDAGraphMode
+
+        compilation = vllm_config.compilation_config
+        if compilation.cudagraph_mode != CUDAGraphMode.NONE:
+            compilation.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+            compilation.mode = CompilationMode.NONE
     speculative_config = _require_hcu_pcp_attribute(
         vllm_config, "speculative_config", "VllmConfig"
     )
