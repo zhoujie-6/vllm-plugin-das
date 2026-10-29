@@ -660,11 +660,24 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
                 "HCU deepep_auto must be normalized to the vLLM 0.25 "
                 "deepep_low_latency configuration contract"
             )
+        # Channel-FP8 V4 registers shared or independent HT/LL tensors in
+        # one EPLB transfer list. The normal sync/async commit boundary thus
+        # publishes routing only after both layouts have been updated.
+        auto_online_eplb = (
+            feature_config.moe_backend == "deep_gemm"
+            and not {"DeepseekV4ForCausalLM", "DeepSeekV4MTPModel"}.isdisjoint(
+                model_architectures(vllm_config)
+            )
+            and getattr(
+                getattr(model_config, "hf_config", None), "expert_dtype", None
+            ) == "fp8"
+        )
         # Static EPLB loads every physical expert directly from the
         # checkpoint before either layout is packed and never rearranges.
         if (
             getattr(parallel_config, "enable_eplb", False)
             and feature_config.expert_map_path is None
+            and not auto_online_eplb
             # Record-only calibration skips weight transfers and map commits.
             and not (
                 feature_config.expert_map_record_path is not None
@@ -672,8 +685,8 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
             )
         ):
             raise ValueError(
-                "deepep_auto with EPLB is not supported because the HT and "
-                "LL expert weight layouts cannot be rebalanced atomically; "
+                "deepep_auto with EPLB is not supported for this model/backend; "
+                "online rebalancing requires DeepSeek V4 FP8 with deep_gemm; "
                 "use a static expert_map_path or expert_map_record_path with disable_rearrange=true instead"
             )
         # Only V4 restores global prefill phase evidence for PCP-only auto.

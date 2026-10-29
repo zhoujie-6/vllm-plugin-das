@@ -3137,3 +3137,22 @@ def test_deepep_auto_record_only_calibration(disable_rearrange):
     else:
         with pytest.raises(ValueError, match="deepep_auto.*EPLB.*not supported"):
             patch_vllm_config.validate_and_update_hcu_config(config)
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+@pytest.mark.parametrize("expert_dtype", ["fp8", "int8"])
+def test_deepep_auto_online_eplb_v4_fp8(use_async, expert_dtype):
+    config = _validation_config(HcuFeatureConfig(
+        deepep_auto=True, moe_backend="deep_gemm"))
+    config.model_config.architectures = ["DeepseekV4ForCausalLM"]
+    config.model_config.hf_config = SimpleNamespace(expert_dtype=expert_dtype)
+    config.parallel_config.all2all_backend = "deepep_low_latency"
+    config.parallel_config.enable_eplb = True
+    config.parallel_config.data_parallel_size = 8
+    config.parallel_config.enable_expert_parallel = True
+    config.parallel_config.eplb_config = SimpleNamespace(use_async=use_async)
+    if expert_dtype == "fp8":
+        patch_vllm_config.validate_and_update_hcu_config(config)
+    else:
+        with pytest.raises(ValueError, match="online rebalancing requires"):
+            patch_vllm_config.validate_and_update_hcu_config(config)
