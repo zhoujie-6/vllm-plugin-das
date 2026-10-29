@@ -1040,3 +1040,18 @@ def test_runtime_has_no_standalone_megamoe_import():
                 assert all(n.name.split(".")[0]!="megamoe" for n in node.names)
             if isinstance(node,ast.ImportFrom):
                 assert (node.module or "").split(".")[0]!="megamoe"
+
+
+@pytest.mark.parametrize("model_type", ["deepseek_v4", "deepseek_v4_dspark"])
+def test_pcp_dspark_megamoe_accepts_decode_graphs(runtime, model_type):
+    config, moe, layer = valid_config()
+    config.model_config.hf_config.model_type = model_type
+    config.model_config.enforce_eager = False
+    config.speculative_config = NS(method="dspark")
+    moe.pcp_size = 8
+    runtime.validate_config(config, moe, layer, "fp8")
+    with pytest.raises(ValueError, match="enforce-eager"):
+        runtime.validate_config(config, moe, layer, "int8")
+    moe.dp_size = 2
+    with pytest.raises(ValueError, match="DP1"):
+        runtime.validate_config(config, moe, layer, "fp8")

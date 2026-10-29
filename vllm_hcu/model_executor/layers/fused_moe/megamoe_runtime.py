@@ -100,10 +100,11 @@ def validate_config(config, moe, layer, quant_mode=None) -> None:
         raise ValueError("HCU MegaMoE requires --dtype bfloat16")
     if moe.is_sequence_parallel:
         raise ValueError("HCU MegaMoE does not support sequence parallelism")
+    dspark = getattr(getattr(config, "speculative_config", None), "method", None) == "dspark"
     if moe.pcp_size > 1 and (
-        moe.dp_size > 1 or not config.model_config.enforce_eager
+        moe.dp_size > 1 or (not config.model_config.enforce_eager and not dspark)
     ):
-        raise ValueError("HCU MegaMoE PCP requires DP1 and eager execution")
+        raise ValueError("HCU MegaMoE PCP requires DP1 and eager execution unless using DSpark")
     shape = (
         moe.num_experts,
         moe.num_local_experts,
