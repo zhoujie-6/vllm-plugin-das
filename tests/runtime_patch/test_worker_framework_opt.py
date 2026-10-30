@@ -2975,3 +2975,27 @@ def test_kv_connector_control_context_does_not_join_dp_phase_collective(
         active._start_load_kv()
     connector.start_load_kv.assert_called_once_with(context)
     assert active._pending_load_start is False
+
+
+@pytest.mark.parametrize("method", ["mtp", "dspark"])
+@pytest.mark.parametrize("static", [False, True])
+def test_native_v4_mtp_fixed_layout_isolates_target_config(method, static):
+    from copy import copy
+    target = SimpleNamespace(
+        speculative_config=SimpleNamespace(method=method,
+            draft_model_config=SimpleNamespace(architectures=["DeepSeekV4MTPModel"])),
+        parallel_config=SimpleNamespace(enable_eplb=True,
+            eplb_config=SimpleNamespace(num_redundant_experts=16)),
+        additional_config={"hcu": HcuFeatureConfig(
+            expert_map_path="/tmp/target.json" if static else None).to_dict()},
+    )
+    draft = copy(target)
+    enabled = patch_eagle_utils._use_fixed_v4_mtp_layout(draft)
+    assert enabled == (method == "mtp" and static)
+    assert target.parallel_config.enable_eplb
+    assert target.parallel_config.eplb_config.num_redundant_experts == 16
+    if enabled:
+        assert not draft.parallel_config.enable_eplb
+        assert draft.parallel_config.eplb_config.num_redundant_experts == 0
+        assert draft.parallel_config._vllm_hcu_expert_map_path is None
+        assert target.additional_config["hcu"]["expert_map_path"] == "/tmp/target.json"

@@ -30,6 +30,35 @@ def _draft_uses_target_model_geometry(draft_model_config: object) -> bool:
     return getattr(text_config, "num_hidden_layers", None) == 0
 
 
+def _use_fixed_v4_mtp_layout(config: object) -> bool:
+    """Isolate native V4 MTP from the target's static placement contract."""
+    spec = config.speculative_config
+    draft = spec.draft_model_config
+    architectures = getattr(draft, "architectures", None) or getattr(
+        getattr(draft, "hf_config", None), "architectures", ()
+    ) or ()
+    feature = get_hcu_config(config)
+    if (
+        getattr(spec, "method", None) != "mtp"
+        or "DeepSeekV4MTPModel" not in architectures
+        or not feature.expert_map_path
+    ):
+        return False
+    config.parallel_config = copy(config.parallel_config)
+    config.parallel_config.enable_eplb = False
+    config.parallel_config.eplb_config = copy(config.parallel_config.eplb_config)
+    config.parallel_config.eplb_config.num_redundant_experts = 0
+    additional = dict(config.additional_config or {})
+    additional["hcu"] = feature.with_updates(
+        expert_map_path=None, expert_map_record_path=None,
+        eplb_disable_rearrange=True,
+    ).to_dict()
+    config.additional_config = additional
+    from vllm_hcu.patch.config import bind_hcu_eplb_config
+    bind_hcu_eplb_config(config)
+    return True
+
+
 def _merge_draft_forward_context(
     target_context: dict,
     draft_context: dict,
@@ -124,7 +153,10 @@ def apply_to_module(module: ModuleType) -> bool:
             draft_all_moe_layers = []
             draft_compilation_config.static_all_moe_layers = draft_all_moe_layers
         draft_vllm_config.compilation_config = draft_compilation_config
+        fixed_mtp = _use_fixed_v4_mtp_layout(draft_vllm_config)
         eagle_model = original(target_model, draft_vllm_config)
+        if fixed_mtp:
+            eagle_model._vllm_hcu_fixed_mtp_layout = True
         renamed = _merge_draft_forward_context(
             target_compilation_config.static_forward_context,
             draft_forward_context,
