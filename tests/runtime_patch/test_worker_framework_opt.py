@@ -3005,3 +3005,30 @@ def test_v4_draft_fixed_layout_isolates_target_config(method, architecture, supp
         assert draft.parallel_config.eplb_config.num_redundant_experts == 0
         assert draft.parallel_config._vllm_hcu_expert_map_path is None
         assert target.additional_config["hcu"]["expert_map_path"] == "/tmp/target.json"
+
+
+def test_deepep_auto_reuses_target_buffer_for_smaller_fixed_draft(monkeypatch):
+    monkeypatch.setitem(sys.modules, "deep_ep", SimpleNamespace(
+        Buffer=SimpleNamespace(set_num_sms=lambda value: None)))
+    module = _fake_all2all_module()
+    allocations = []
+    def get_handle(self, kwargs):
+        handle = object()
+        allocations.append((dict(kwargs), handle))
+        return handle
+    monkeypatch.setattr(module.DeepEPLLAll2AllManager, "get_handle", get_handle, raising=False)
+    patch_all2all.apply_to_module(module)
+    manager = module.DeepEPAutoAll2AllManager("group")
+    target = dict(max_num_tokens_per_dp_rank=256, token_hidden_size=4096,
+                  num_ep_ranks=8, num_global_experts=272, num_local_experts=34)
+    draft = dict(target, num_global_experts=256, num_local_experts=32)
+    original_draft = dict(draft)
+    handle = manager.get_handle(target)
+    assert manager.get_handle(draft) is handle
+    assert manager.get_handle(target) is handle
+    assert len(allocations) == 1
+    assert draft == original_draft
+    # Different hidden geometry cannot alias the original communication layout.
+    other = manager.get_handle(dict(draft, token_hidden_size=8192))
+    assert other is not handle
+    assert len(allocations) == 2
