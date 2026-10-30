@@ -99,6 +99,19 @@ def apply_to_module(module: ModuleType) -> bool:
             bind_static_eplb_plan,
         )
 
+        # DSpark uses its own loader, bypassing load_eagle_model. Isolate
+        # the draft config before construction and static-plan binding here.
+        from copy import copy
+        from .patch_eagle_utils import _use_fixed_v4_draft_layout
+
+        architectures = getattr(model_config, "architectures", ()) or ()
+        fixed_draft = False
+        if {"DSparkDraftModel", "DeepSeekV4MTPModel"}.intersection(architectures):
+            candidate = copy(vllm_config)
+            fixed_draft = _use_fixed_v4_draft_layout(candidate)
+            if fixed_draft:
+                vllm_config = candidate
+
         validate_static_loader(
             vllm_config,
             getattr(vllm_config, "load_config", None),
@@ -112,6 +125,8 @@ def apply_to_module(module: ModuleType) -> bool:
                 model_class=model_class,
                 model_config=model_config,
             )
+            if fixed_draft:
+                model._vllm_hcu_fixed_draft_layout = True
             if depth == 0:
                 bind_static_eplb_plan(vllm_config, model)
             return model
