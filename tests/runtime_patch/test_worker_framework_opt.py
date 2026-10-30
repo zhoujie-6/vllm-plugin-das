@@ -2977,21 +2977,27 @@ def test_kv_connector_control_context_does_not_join_dp_phase_collective(
     assert active._pending_load_start is False
 
 
-@pytest.mark.parametrize("method", ["mtp", "dspark"])
+@pytest.mark.parametrize("method,architecture,supported", [
+    ("mtp", "DeepSeekV4MTPModel", True),
+    ("dspark", "DSparkDraftModel", True),
+    ("dspark", "DeepSeekV4MTPModel", False),
+    ("mtp", "OtherMTPModel", False),
+    ("eagle", "DSparkDraftModel", False),
+])
 @pytest.mark.parametrize("static", [False, True])
-def test_native_v4_mtp_fixed_layout_isolates_target_config(method, static):
+def test_v4_draft_fixed_layout_isolates_target_config(method, architecture, supported, static):
     from copy import copy
     target = SimpleNamespace(
         speculative_config=SimpleNamespace(method=method,
-            draft_model_config=SimpleNamespace(architectures=["DeepSeekV4MTPModel"])),
+            draft_model_config=SimpleNamespace(architectures=[architecture])),
         parallel_config=SimpleNamespace(enable_eplb=True,
             eplb_config=SimpleNamespace(num_redundant_experts=16)),
         additional_config={"hcu": HcuFeatureConfig(
             expert_map_path="/tmp/target.json" if static else None).to_dict()},
     )
     draft = copy(target)
-    enabled = patch_eagle_utils._use_fixed_v4_mtp_layout(draft)
-    assert enabled == (method == "mtp" and static)
+    enabled = patch_eagle_utils._use_fixed_v4_draft_layout(draft)
+    assert enabled == (supported and static)
     assert target.parallel_config.enable_eplb
     assert target.parallel_config.eplb_config.num_redundant_experts == 16
     if enabled:

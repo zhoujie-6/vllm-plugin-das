@@ -30,17 +30,21 @@ def _draft_uses_target_model_geometry(draft_model_config: object) -> bool:
     return getattr(text_config, "num_hidden_layers", None) == 0
 
 
-def _use_fixed_v4_mtp_layout(config: object) -> bool:
-    """Isolate native V4 MTP from the target's static placement contract."""
+def _use_fixed_v4_draft_layout(config: object) -> bool:
+    """Isolate native V4 MTP/DSpark from the target's static placement contract."""
     spec = config.speculative_config
     draft = spec.draft_model_config
     architectures = getattr(draft, "architectures", None) or getattr(
         getattr(draft, "hf_config", None), "architectures", ()
     ) or ()
     feature = get_hcu_config(config)
+    architecture = {
+        "mtp": "DeepSeekV4MTPModel",
+        "dspark": "DSparkDraftModel",
+    }.get(getattr(spec, "method", None))
     if (
-        getattr(spec, "method", None) != "mtp"
-        or "DeepSeekV4MTPModel" not in architectures
+        architecture is None
+        or architecture not in architectures
         or not feature.expert_map_path
     ):
         return False
@@ -153,10 +157,10 @@ def apply_to_module(module: ModuleType) -> bool:
             draft_all_moe_layers = []
             draft_compilation_config.static_all_moe_layers = draft_all_moe_layers
         draft_vllm_config.compilation_config = draft_compilation_config
-        fixed_mtp = _use_fixed_v4_mtp_layout(draft_vllm_config)
+        fixed_draft = _use_fixed_v4_draft_layout(draft_vllm_config)
         eagle_model = original(target_model, draft_vllm_config)
-        if fixed_mtp:
-            eagle_model._vllm_hcu_fixed_mtp_layout = True
+        if fixed_draft:
+            eagle_model._vllm_hcu_fixed_draft_layout = True
         renamed = _merge_draft_forward_context(
             target_compilation_config.static_forward_context,
             draft_forward_context,

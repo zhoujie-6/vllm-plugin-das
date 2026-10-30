@@ -420,8 +420,8 @@ def apply_to_module(module) -> bool:
 
     @functools.wraps(original_add)
     def add_model(self, model, model_config):
-        if getattr(model, "_vllm_hcu_fixed_mtp_layout", False):
-            # Native MTP owns fixed initial weights and no EPLB load counters.
+        if getattr(model, "_vllm_hcu_fixed_draft_layout", False):
+            # Native MTP/DSpark owns fixed initial weights and no EPLB load counters.
             return None
         load_path, record_path = _paths(self.parallel_config)
         if not load_path and not record_path:
