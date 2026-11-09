@@ -9198,6 +9198,31 @@ def test_int8_master_off_replaces_upstream_aiter_kernel_with_triton(
     assert type(scheme.kernel).__name__ == "TritonInt8ScaledMMLinearKernel"
 
 
+def test_int8_failed_native_validation_keeps_triton_layout_and_execution(monkeypatch):
+    class CudaParameter(torch.nn.Parameter):
+        @property
+        def is_cuda(self):
+            return True
+
+    kernel = object()
+    monkeypatch.setattr(patch_compressed_tensors_w8a8_int8,
+                        "_custom_quantization_enabled", lambda: True)
+    monkeypatch.setattr(patch_compressed_tensors_w8a8_int8,
+                        "_make_triton_int8_kernel", lambda scheme: kernel)
+    monkeypatch.setattr(int8_runtime, "int8_hipblaslt_is_usable",
+                        lambda device, dtype: False)
+    module = _fake_int8_scheme_module()
+    patch_compressed_tensors_w8a8_int8.apply_to_module(module)
+    scheme = module.CompressedTensorsW8A8Int8()
+    layer = SimpleNamespace(weight=CudaParameter(torch.ones(2, 3)),
+                            params_dtype=torch.bfloat16)
+    scheme.process_weights_after_loading(layer)
+    assert scheme.kernel is kernel
+    assert layer.weight.shape == (3, 2)
+    assert scheme.supports_quanted_inputs() is False
+    assert scheme.apply_weights(layer, "x", None)[0] == "upstream"
+
+
 def test_int8_scheme_layout_and_feature_off_delegation(monkeypatch: pytest.MonkeyPatch):
     class TritonInt8ScaledMMLinearKernel:
         pass

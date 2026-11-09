@@ -4,11 +4,39 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import torch
 
 
 class HcuInt8LinearError(RuntimeError):
     """The explicitly enabled HCU INT8 kernel cannot execute safely."""
+
+
+@lru_cache(maxsize=None)
+def int8_hipblaslt_is_usable(device: torch.device, dtype: torch.dtype) -> bool:
+    """Validate the native backend before choosing its persistent weight layout.
+
+    Some LightOp/rocBLASLt installations report success without producing valid
+    INT8 output. Check actual values, rather than the wrapper's success flag.
+    This runs during loading, never inside a captured forward graph.
+    """
+    from lightop.gemm_ops import hipblaslt_w8a8_gemm
+
+    with torch.inference_mode():
+        a = torch.ones((4, 128), device=device, dtype=torch.int8)
+        b = torch.ones((128, 128), device=device, dtype=torch.int8)
+        sa = torch.full((4, 1), 0.5, device=device, dtype=torch.float32)
+        sb = torch.full((128, 1), 0.25, device=device, dtype=torch.float32)
+        try:
+            ok, out = hipblaslt_w8a8_gemm(
+                a, b, sa, sb, 4, 128, 128, "NT", dtype
+            )
+            return bool(ok) and out.shape == (4, 128) and torch.equal(
+                out, torch.full((4, 128), 16.0, device=device, dtype=dtype)
+            )
+        except RuntimeError:
+            return False
 
 
 def weight8bit_nt_kpack2_marlin2(

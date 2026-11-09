@@ -101,11 +101,28 @@ def apply_to_module(module: ModuleType) -> bool:
 
     from vllm_hcu.model_executor.layers.quantization.int8_runtime import (
         apply_int8_linear,
+        int8_hipblaslt_is_usable,
     )
 
     @functools.wraps(original_process)
     def hcu_process_weights_after_loading(self, layer) -> None:
-        if not _custom_quantization_enabled():
+        use_custom = _custom_quantization_enabled()
+        weight = getattr(layer, "weight", None)
+        if use_custom and getattr(weight, "is_cuda", False):
+            import torch
+            from vllm.logger import init_logger
+
+            dtype = getattr(layer, "params_dtype", torch.bfloat16)
+            if dtype not in (torch.bfloat16, torch.float16):
+                dtype = torch.bfloat16
+            use_custom = int8_hipblaslt_is_usable(weight.device, dtype)
+            if not use_custom:
+                init_logger(__name__).warning_once(
+                    "LightOp INT8 hipBLASLt numerical validation failed; "
+                    "using vLLM Triton INT8 weights and execution."
+                )
+        self._hcu_use_triton_int8 = not use_custom
+        if self._hcu_use_triton_int8:
             # The ROCm auto/explicit-AITER selector may have constructed an
             # AITER kernel already. Replace it before any layout conversion so
             # master-off deterministically owns both the Triton weight layout
@@ -140,7 +157,7 @@ def apply_to_module(module: ModuleType) -> bool:
         bias,
         x_and_scale_quanted=None,
     ):
-        if not _custom_quantization_enabled():
+        if getattr(self, "_hcu_use_triton_int8", False) or not _custom_quantization_enabled():
             return original_apply(self, layer, x, bias)
         return apply_int8_linear(
             input=x,
@@ -155,7 +172,9 @@ def apply_to_module(module: ModuleType) -> bool:
         )
 
     def supports_quanted_inputs(self) -> bool:
-        return _custom_quantization_enabled()
+        return _custom_quantization_enabled() and not getattr(
+            self, "_hcu_use_triton_int8", False
+        )
 
     for function in (hcu_process_weights_after_loading, hcu_apply_weights):
         setattr(function, _WRAPPER_MARKER, True)
