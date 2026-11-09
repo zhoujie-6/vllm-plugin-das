@@ -58,9 +58,18 @@ def select_attention(cfg):
     return HcuV41PcpAttention
 
 
+
+def select_moe(vllm_config, *args, **kwargs):
+    if getattr(getattr(vllm_config, "kernel_config", None), "moe_backend", None) == "deep_gemm_mega_moe":
+        from ..v41_megamoe_model import HcuV41MegaMoE
+        return HcuV41MegaMoE(vllm_config, *args, **kwargs)
+    return native.DeepseekV4MoE(vllm_config, *args, **kwargs)
+
+
 _DECODER_INIT = _constructor(_DECODER_NATIVE, _REVIEWED[0],
                              {'_select_dsv4_attn_cls': select_attention,
-                              'Engram': HcuV41PcpEngram})
+                              'Engram': HcuV41PcpEngram,
+                              'DeepseekV4MoE': select_moe})
 
 
 class HcuV41PcpDecoderLayer(native.DeepseekV4DecoderLayer):
@@ -118,6 +127,9 @@ class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
         from ..v41_pcp_activation import check_health
         check_health()
         check_native_contract()
+        from ..environment import static_expert_map_path
+        if static_expert_map_path() and vllm_config.kernel_config.moe_backend != "deep_gemm_mega_moe":
+            raise ValueError("The V41 static expert map requires deep_gemm_mega_moe")
         if vllm_config.parallel_config.prefill_context_parallel_size > 1:
             from ..v41_pcp_activation import pcp_enabled
             if not pcp_enabled():

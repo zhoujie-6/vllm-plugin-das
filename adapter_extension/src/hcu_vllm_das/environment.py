@@ -60,3 +60,8 @@ def register_compile_factors(vllm_envs: object) -> None:
 
 
 __all__ = ["custom_ops_enabled", "rms_norm_enabled", "register_compile_factors"]
+
+
+def static_expert_map_path():
+    """Optional existing v2 static placement artifact, target layers only."""
+    return os.environ.get("VLLM_HCU_DSV41_STATIC_EXPERT_MAP", "").strip()

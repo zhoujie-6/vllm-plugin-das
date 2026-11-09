@@ -184,6 +184,10 @@ class HcuDSV41ChannelFP8Config(DeepseekV4FP8Config):
                     and input_quant.dynamic
                     and weight_quant.block_structure is None
                 ):
+                    if layer.moe_config.moe_backend == "deep_gemm_mega_moe":
+                        from ..moe.v41_megamoe import HcuV41MegaMoEMethod
+                        return HcuV41MegaMoEMethod(
+                            weight_quant, input_quant, layer.moe_config, prefix)
                     from .channel_fp8_moe import HcuDSV41ChannelFP8MoEMethod
 
                     return HcuDSV41ChannelFP8MoEMethod(

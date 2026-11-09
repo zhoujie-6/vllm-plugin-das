@@ -1,0 +1,349 @@
+# SPDX-License-Identifier: Apache-2.0
+"""V4.1 Channel-FP8 MegaMoE via the installed deepgemm.mega API.
+
+The official runner owns routing, shared experts and routed scaling. MegaMoE
+owns dispatch, the two GEMMs and combine. Each PCP rank submits only its rows.
+"""
+from __future__ import annotations
+
+import inspect
+import torch
+from vllm.config import get_current_vllm_config
+from vllm.distributed import get_ep_group
+from vllm.model_executor.layers.fused_moe import modular_kernel as mk
+from vllm.model_executor.layers.fused_moe.fused_moe_method_base import FusedMoEMethodBase
+from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import TopKWeightAndReduceNoOP
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w8a8_fp8 import CompressedTensorsW8A8Fp8MoEMethod
+from .channel_fp8_runtime import ChannelFP8ContiguousExperts
+from ..v41_static_eplb import static_plan, bind_weight_loaders, routing_table, map_routes
+
+
+def validate_config(config, moe):
+    p = config.parallel_config
+    if (p.tensor_parallel_size != 1 or p.data_parallel_size != 1
+            or p.pipeline_parallel_size != 1 or moe.pcp_size != 8
+            or moe.ep_size != 8 or not p.enable_expert_parallel):
+        raise ValueError("V41 MegaMoE requires TP1/DP1/PP1/PCP8/EP8")
+    if not config.model_config.enforce_eager or p.enable_dbo:
+        raise ValueError("V41 MegaMoE currently requires eager execution without DBO")
+    if p.enable_eplb:
+        raise ValueError("Use the static expert-map file; dynamic EPLB is unsupported")
+    if not moe.moe_parallel_config.use_deepep_ht_kernels:
+        raise ValueError("V41 MegaMoE requires deepep_high_throughput metadata")
+    if (moe.in_dtype != torch.bfloat16 or moe.is_sequence_parallel
+            or moe.has_bias or moe.is_lora_enabled or not moe.is_act_and_mul
+            or moe.activation.value != "silu"):
+        raise ValueError("V41 MegaMoE requires BF16 gated SiLU without SP/bias/LoRA")
+    if (moe.experts_per_token, moe.hidden_dim, moe.intermediate_size_per_partition) not in (
+            (6, 5120, 2304), (3, 5120, 2304)):
+        raise ValueError("V41 MegaMoE requires a vendor-compiled target/DSpark shape")
+    if (moe.hidden_dim % 64 or moe.intermediate_size_per_partition % 128
+            or moe.num_experts % moe.ep_size
+            or moe.swiglu_alpha is not None or moe.swiglu_beta is not None):
+        raise ValueError("Unsupported V41 MegaMoE shape or parameterized SwiGLU")
+    offload = getattr(config, "offload_config", None)
+    if offload is not None and (
+            offload.uva.cpu_offload_gb or offload.prefetch.offload_group_size):
+        raise ValueError("V41 MegaMoE does not support model weight offloading")
+    if getattr(config.model_config, "enable_sleep_mode", False):
+        raise ValueError("V41 MegaMoE IPC buffers do not support sleep mode")
+    if moe.skip_final_all_reduce:
+        raise ValueError("V41 MegaMoE owns its final combine")
+    if str(p.expert_placement_strategy).split(".")[-1].lower() != "linear":
+        raise ValueError("V41 MegaMoE requires linear physical expert placement")
+
+
+def provider():
+    import deepgemm.mega as mega
+    for name, args, kwargs in (
+        ("transform_weights_for_mega_moe", (None, None), {}),
+        ("get_symm_buffer_for_mega_moe", (None, 256, 64, 6, 4096, 2048),
+         dict(use_fp8_dispatch=True, activation="swiglu")),
+        ("mega_moe_preprocess", (None, None, None, None, 0), {}),
+        ("fp8_mega_moe", (None, None, None, None),
+         dict(activation_clamp=float("inf"), fast_math=True)),
+    ):
+        fn = getattr(mega, name, None)
+        if not callable(fn):
+            raise RuntimeError(f"Missing deepgemm.mega.{name}")
+        inspect.signature(fn).bind(*args, **kwargs)
+    return mega
+
+
+
+def make_buffer(mega, group, num_experts, capacity, topk, hidden, intermediate):
+    """Admit both native HT tiles using the actual public buffer layout.
+
+    Extra physical experts change the native ring padding. A scheduler-aligned
+    input capacity alone does not imply a BLOCK_M=128-aligned ring.
+    """
+    def allocate(tokens):
+        return mega.get_symm_buffer_for_mega_moe(
+            group, num_experts, tokens, topk, hidden, intermediate,
+            use_fp8_dispatch=True, activation="swiglu")
+
+    buf = allocate(capacity)
+    if buf.l1_acts.shape[0] % 128:
+        buf.destroy()
+        raise RuntimeError("MegaMoE native pool capacity is not HT BLOCK_M=128 aligned")
+    ring = buf.l2_acts.shape[0]
+    if ring % 128:
+        stride = group.size() * topk
+        padding = ring - stride * capacity
+        target = next((n for n in range(capacity + 1, capacity + 129)
+                       if (stride * n + padding) % 128 == 0), None)
+        buf.destroy()
+        if padding < 0 or target is None:
+            raise RuntimeError("MegaMoE native ring geometry cannot be aligned safely")
+        buf = allocate(target)
+        if buf.l1_acts.shape[0] % 128 or buf.l2_acts.shape[0] % 128:
+            buf.destroy()
+            raise RuntimeError("MegaMoE native ring layout changed during capacity alignment")
+    return buf
+
+_PREFLIGHT_KEYS = set()
+
+
+def preflight_staging(mega, device):
+    """Reject non-executing vendor binaries before packing model weights.
+
+    Host checks are confined to this startup probe; the forward path has no
+    device-to-host reads. A compatible Python signature is not execution proof.
+    """
+    import os
+    from types import SimpleNamespace
+    key = (os.getpid(), str(device), mega.mega_moe_preprocess)
+    if key in _PREFLIGHT_KEYS:
+        return
+    rows, hidden, topk = 2, 5120, 6
+    x = torch.ones((rows, hidden), dtype=torch.bfloat16, device=device)
+    ids = torch.arange(rows * topk, device=device, dtype=torch.int64).view(rows, topk)
+    weights = torch.full((rows, topk), 0.25, dtype=torch.float32, device=device)
+    buf = SimpleNamespace(
+        x=torch.zeros_like(x, dtype=torch.float8_e4m3fn),
+        x_sf=torch.zeros(rows, dtype=torch.float32, device=device),
+        topk_idx=torch.full_like(ids, -1),
+        topk_weights=torch.zeros_like(weights),
+    )
+    from contextlib import nullcontext
+    guard = torch.cuda.device(device) if torch.device(device).type == "cuda" else nullcontext()
+    with guard:
+        mega.mega_moe_preprocess(x, ids, weights, buf, rows)
+    expected_scale = torch.full_like(buf.x_sf, 1.0 / 448.0)
+    if not (torch.equal(buf.topk_idx, ids)
+            and torch.equal(buf.topk_weights, weights)
+            and torch.equal(buf.x.float(), torch.full_like(x, 448.0).float())
+            and torch.allclose(buf.x_sf, expected_scale, rtol=1e-6, atol=0)):
+        raise RuntimeError(
+            "Installed deepgemm.mega preprocess failed its startup execution probe "
+            "(routing/FP8/scales were not written correctly). A valid Python ABI "
+            "does not prove a usable gfx938 kernel image. Check the vendor binary "
+            "and HIP runtime; restart after installing a compatible provider."
+        )
+    _PREFLIGHT_KEYS.add(key)
+
+
+class MegaPrepare(mk.FusedMoEPrepareAndFinalizeModular):
+    def __init__(self, table=None):
+        self.table = table
+
+    @property
+    def activation_format(self):
+        return mk.FusedMoEActivationFormat.Standard
+
+    def topk_indices_dtype(self):
+        return torch.int64
+
+    def max_num_tokens_per_rank(self):
+        return None
+
+    def num_dispatchers(self):
+        return 1
+
+    def output_is_reduced(self):
+        return True
+
+    def prepare(self, a1, topk_weights, topk_ids, num_experts, expert_map,
+                apply_router_weight_on_input, quant_config, defer_input_quant):
+        if apply_router_weight_on_input:
+            raise ValueError("MegaMoE applies routing weights after GEMM2")
+        ids = map_routes(topk_ids, self.table) if self.table is not None else topk_ids
+        return a1, None, None, ids, topk_weights
+
+    def finalize(self, output, fused_expert_output, topk_weights, topk_ids,
+                 apply_router_weight_on_input, weight_and_reduce_impl):
+        if output is not fused_expert_output:
+            output.copy_(fused_expert_output)
+
+
+class MegaExperts(ChannelFP8ContiguousExperts):
+    def __init__(self, moe, quant, buffer, l1, l2, mega):
+        mk.FusedMoEExpertsModular.__init__(self, moe, quant)
+        self.buffer, self.l1, self.l2, self.mega = buffer, l1, l2, mega
+
+    @property
+    def expects_unquantized_inputs(self):
+        return True
+
+    def moe_problem_size(self, a1, w1, w2, topk_ids):
+        return (self.moe_config.num_local_experts, a1.shape[0],
+                2 * self.moe_config.intermediate_size_per_partition,
+                self.moe_config.hidden_dim, topk_ids.shape[1])
+
+    def workspace_shapes(self, M, N, K, topk, global_num_experts,
+                         local_num_experts, expert_tokens_meta, activation):
+        return (0,), (0,), (M, K)
+
+    def finalize_weight_and_reduce_impl(self):
+        return TopKWeightAndReduceNoOP()
+
+    def run(self, output, x, ids, weights):
+        if (x.ndim != 2 or x.dtype != torch.bfloat16
+                or x.shape[1] != self.moe_config.hidden_dim
+                or ids.shape != weights.shape
+                or ids.shape != (x.shape[0], self.moe_config.experts_per_token)):
+            raise ValueError("MegaMoE activation/routing shape or dtype mismatch")
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("V41 MegaMoE eager path cannot be captured")
+        if x.shape[0] > self.buffer.num_max_tokens_per_rank:
+            raise ValueError("MegaMoE per-rank token capacity exceeded")
+        # No early return on an empty rank: peers still need its IPC barriers.
+        if x.shape[0]:
+            self.mega.mega_moe_preprocess(
+                x.contiguous(), ids.to(torch.int64).contiguous(),
+                weights.float().contiguous(), self.buffer, x.shape[0])
+        self.mega.fp8_mega_moe(
+            output, self.l1, self.l2, self.buffer,
+            activation_clamp=(self.quant_config.gemm1_clamp_limit
+                              if self.quant_config.gemm1_clamp_limit is not None
+                              else float("inf")), fast_math=True)
+
+    def apply(self, output, hidden_states, w1, w2, topk_weights, topk_ids,
+              activation, global_num_experts, expert_map, a1q_scale, a2_scale,
+              workspace13, workspace2, expert_tokens_meta,
+              apply_router_weight_on_input):
+        self.run(output, hidden_states, topk_ids, topk_weights)
+
+
+class MegaKernel(mk.FusedMoEKernel):
+    def apply(self, hidden_states, w1, w2, topk_weights, topk_ids, activation,
+              global_num_experts, expert_map, apply_router_weight_on_input,
+              shared_experts=None, shared_experts_input=None):
+        # The stock modular executor skips experts when M=0, which would
+        # deadlock an IPC collective. All row counts use this same launch path.
+        x, _, _, ids, weights = self.prepare_finalize.prepare(
+            hidden_states, topk_weights, topk_ids, global_num_experts,
+            expert_map, apply_router_weight_on_input,
+            self.fused_experts.quant_config, True)
+        output = torch.empty_like(x)
+        self.fused_experts.run(output, x, ids, weights)
+        return output
+
+
+class HcuV41MegaMoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
+    def __init__(self, weight_quant, input_quant, moe, prefix):
+        FusedMoEMethodBase.__init__(self, moe)
+        validate_config(get_current_vllm_config(), moe)
+        self.weight_quant, self.input_quant = weight_quant, input_quant
+        self.weight_block_size = None
+        self.block_quant = self.static_input_scales = False
+        self._prefix = prefix
+        self._processed = False
+        self._failure = None
+        self.experts_cls = MegaExperts
+
+    @property
+    def supports_eplb(self):
+        # Static placement is installed at construction; no dynamic migration.
+        return False
+
+    def maybe_roundup_sizes(self, hidden_size, intermediate_size_per_partition,
+                            act_dtype, moe_parallel_config):
+        return hidden_size, intermediate_size_per_partition
+
+    def create_weights(self, layer, *args, **kwargs):
+        super().create_weights(layer, *args, **kwargs)
+        plan = static_plan(get_current_vllm_config())
+        self._plan = plan
+        if plan is not None:
+            bind_weight_loaders(layer, plan, self._prefix)
+
+    def get_fused_moe_quant_config(self, layer):
+        from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+        return FusedMoEQuantConfig.make(
+            torch.float8_e4m3fn, w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale, per_act_token_quant=True,
+            per_out_ch_quant=True, gemm1_clamp_limit=layer.swiglu_limit)
+
+    def process_weights_after_loading(self, layer):
+        if self._failure is not None:
+            raise RuntimeError(self._failure)
+        try:
+            return self._process_weights(layer)
+        except BaseException:
+            if self._failure is None:
+                self._failure = "MegaMoE post-load failed; restart process"
+            raise
+
+    @torch.inference_mode()
+    def _process_weights(self, layer):
+        if self._processed:
+            self._failure = "MegaMoE packed weights cannot be postprocessed twice; restart for reload"
+            raise RuntimeError(self._failure)
+        mega = provider()
+        preflight_staging(mega, layer.w13_weight.device)
+        if layer.apply_router_weight_on_input or layer.expert_map_manager.num_fused_shared_experts:
+            raise ValueError("MegaMoE requires separate shared experts and output routing weights")
+        w1, w2 = layer.w13_weight, layer.w2_weight
+        s1, s2 = layer.w13_weight_scale, layer.w2_weight_scale
+        if w1.dtype != torch.float8_e4m3fn or w2.dtype != torch.float8_e4m3fn:
+            raise ValueError("MegaMoE requires E4M3FN checkpoint weights")
+        l1, l2 = mega.transform_weights_for_mega_moe(
+            (w1, s1.reshape(w1.shape[:2]).float().contiguous()),
+            (w2, s2.reshape(w2.shape[:2]).float().contiguous()))
+        ep = get_ep_group()
+        if ep.world_size != self.moe.ep_size:
+            raise ValueError("MegaMoE EP group differs from expert placement")
+        if self._plan is not None:
+            from ..v41_static_eplb import verify_static_plan_across_ep_ranks
+            verify_static_plan_across_ep_ranks(self._plan)
+        cache = getattr(ep, "_hcu_v41_mega_buffers", None)
+        if cache is None:
+            cache = ep._hcu_v41_mega_buffers = {}
+        # PCP has already split the local batch. Do not multiply by EP/PCP.
+        capacity = self.moe.max_num_tokens
+        key = (w1.device, self.moe.num_experts, capacity,
+               self.moe.experts_per_token, self.moe.hidden_dim,
+               self.moe.intermediate_size_per_partition)
+        if key not in cache:
+            cache[key] = make_buffer(
+                mega, ep.device_group, self.moe.num_experts, capacity,
+                self.moe.experts_per_token, self.moe.hidden_dim,
+                self.moe.intermediate_size_per_partition)
+        # Keep exactly one copy of expert weights. The native loader's shapes
+        # and Parameter objects remain visible for model memory accounting.
+        pairs = ((w1, l1[0]), (w2, l2[0]), (s1, l1[1]), (s2, l2[1]))
+        for param, packed in pairs:
+            if param.numel() != packed.numel() or param.dtype != packed.dtype:
+                raise ValueError("MegaMoE packing changed weight element count/dtype")
+        for param, packed in pairs:
+            param.data = packed.reshape(param.shape)
+        quant = self.get_fused_moe_quant_config(layer)
+        table = routing_table(self._plan, self._prefix, w1.device) if self._plan else None
+        self.moe_quant_config = quant
+        self.moe_kernel = MegaKernel(
+            MegaPrepare(table), MegaExperts(self.moe, quant, cache[key], l1, l2, mega))
+        self._processed = True
+        if ep.rank_in_group == 0:
+            from vllm.logger import init_logger
+            init_logger(__name__).info(
+                "HCU V41 MegaMoE ready: layer=%s provider=%s physical=%d "
+                "local=%d topk=%d capacity=%d static_sha=%s",
+                self._prefix, mega.__file__, self.moe.num_experts,
+                self.moe.num_local_experts, self.moe.experts_per_token,
+                cache[key].num_max_tokens_per_rank, self._plan.source_sha256 if self._plan else "none")
+
+    def apply(self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input):
+        if self._failure is not None:
+            raise RuntimeError(self._failure)
+        return super().apply(layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input)
