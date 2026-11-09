@@ -150,7 +150,8 @@ def test_startup_probe_rejects_nonexecuting_vendor(write_outputs):
         def mega_moe_preprocess(self,x,ids,weights,buf,rows):
             if write_outputs:
                 buf.topk_idx.copy_(ids);buf.topk_weights.copy_(weights)
-                buf.x.fill_(448);buf.x_sf.fill_(1/448)
+                sf=x.float().abs().amax(-1)*torch.tensor(1/448,dtype=torch.float32)
+                buf.x.copy_((x.float()/sf[:,None]).to(buf.x.dtype));buf.x_sf.copy_(sf)
     vendor=Vendor()
     if write_outputs:
         preflight_staging(vendor,"cpu")
@@ -176,7 +177,8 @@ def test_staging_routing_dtype_ignores_bf16_default():
             assert weights.dtype == buf.topk_weights.dtype == torch.float32
             assert buf.x_sf.dtype == torch.float32
             buf.topk_idx.copy_(ids);buf.topk_weights.copy_(weights)
-            buf.x.fill_(448);buf.x_sf.fill_(1/448)
+            sf=x.float().abs().amax(-1)*torch.tensor(1/448,dtype=torch.float32)
+            buf.x.copy_((x.float()/sf[:,None]).to(buf.x.dtype));buf.x_sf.copy_(sf)
     previous=torch.get_default_dtype()
     try:
         torch.set_default_dtype(torch.bfloat16)
@@ -231,3 +233,28 @@ def test_incompatible_native_pool_is_destroyed_before_rejection():
     with pytest.raises(RuntimeError,match="pool capacity"):
         make_buffer(Vendor(),NS(size=lambda:8),392,2048,6,5120,2304)
     assert destroyed==[True]
+
+
+def test_staging_rejects_division_at_fp8_midpoint():
+    from hcu_vllm_das.moe.v41_megamoe import preflight_staging
+    class DividingVendor:
+        def mega_moe_preprocess(self,x,ids,weights,buf,rows):
+            scale=x.float().abs().amax(-1)/448
+            buf.x.copy_((x.float()/scale[:,None]).to(buf.x.dtype))
+            buf.x_sf.copy_(scale)
+            buf.topk_idx.copy_(ids);buf.topk_weights.copy_(weights)
+    with pytest.raises(RuntimeError,match="rounding/scale contract"):
+        preflight_staging(DividingVendor(),"cpu")
+
+
+def test_staging_checks_known_bf16_fp8_midpoint_bytes():
+    from hcu_vllm_das.moe.v41_megamoe import preflight_staging
+    class Vendor:
+        def mega_moe_preprocess(self,x,ids,weights,buf,rows):
+            scale=x.float().abs().amax(-1)*torch.tensor(1/448,dtype=torch.float32)
+            q=(x.float()/scale[:,None]).to(buf.x.dtype)
+            assert int(scale[0].view(torch.int32)) == 0x3be00001
+            assert int(q.view(torch.uint8)[0,1]) == 0xdf
+            buf.x.copy_(q);buf.x_sf.copy_(scale)
+            buf.topk_idx.copy_(ids);buf.topk_weights.copy_(weights)
+    preflight_staging(Vendor(),"cpu")

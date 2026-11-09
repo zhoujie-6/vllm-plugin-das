@@ -117,6 +117,12 @@ def preflight_staging(mega, device):
         return
     rows, hidden, topk = 2, 5120, 6
     x = torch.ones((rows, hidden), dtype=torch.bfloat16, device=device)
+    # BF16 values on FP8 midpoints distinguish rounded division from the
+    # provider's FP32 multiply-by-reciprocal scale (3.0625 -> 0x3be00001).
+    x[:, 0] = 3.0625
+    x[:, 1] = -0.2119140625
+    x[:, 2] = -0.314453125
+    x[:, 3] = -0.62890625
     ids = torch.arange(rows * topk, device=device, dtype=torch.int64).view(rows, topk)
     weights = torch.full((rows, topk), 0.25, dtype=torch.float32, device=device)
     buf = SimpleNamespace(
@@ -129,14 +135,16 @@ def preflight_staging(mega, device):
     guard = torch.cuda.device(device) if torch.device(device).type == "cuda" else nullcontext()
     with guard:
         mega.mega_moe_preprocess(x, ids, weights, buf, rows)
-    expected_scale = torch.full_like(buf.x_sf, 1.0 / 448.0)
+    expected_scale = x.float().abs().amax(-1) * torch.tensor(
+        1.0 / 448.0, dtype=torch.float32, device=device)
+    expected_q = (x.float() / expected_scale[:, None]).to(torch.float8_e4m3fn)
     if not (torch.equal(buf.topk_idx, ids)
             and torch.equal(buf.topk_weights, weights)
-            and torch.equal(buf.x.float(), torch.full_like(x, 448.0).float())
-            and torch.allclose(buf.x_sf, expected_scale, rtol=1e-6, atol=0)):
+            and torch.equal(buf.x.view(torch.uint8), expected_q.view(torch.uint8))
+            and torch.equal(buf.x_sf, expected_scale)):
         raise RuntimeError(
             "Installed deepgemm.mega preprocess failed its startup execution probe "
-            "(routing/FP8/scales were not written correctly). A valid Python ABI "
+            "(routing or FP8 rounding/scale contract mismatch). A valid Python ABI "
             "does not prove a usable gfx938 kernel image. Check the vendor binary "
             "and HIP runtime; restart after installing a compatible provider."
         )
