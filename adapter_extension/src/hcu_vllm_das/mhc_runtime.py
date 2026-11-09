@@ -62,6 +62,28 @@ provider = SimpleNamespace(mhc_pre=None, mhc_post=None,
 _registered = False
 
 
+
+def _provider_signature(function, name):
+    signature = inspect.signature(function)
+    if tuple(signature.parameters) != ('args', 'kwargs'):
+        return signature
+    # AITER torch_compile_guard hides the Python signature. Its registered
+    # dispatcher schema retains the actual argument names and defaults.
+    packet = getattr(torch.ops.aiter, name, None)
+    operation = getattr(packet, 'default', None)
+    schema = getattr(operation, '_schema', None)
+    if schema is None or schema.name != f'aiter::{name}':
+        raise RuntimeError(f'HCU mHC provider has no verifiable schema: {name}')
+    parameters = []
+    for argument in schema.arguments:
+        kind = (inspect.Parameter.KEYWORD_ONLY if argument.kwarg_only
+                else inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        default = (argument.default_value if argument.has_default_value()
+                   else inspect.Parameter.empty)
+        parameters.append(inspect.Parameter(argument.name, kind, default=default))
+    return inspect.Signature(parameters)
+
+
 def load_provider():
     try:
         module = import_module('aiter.ops.mhc')
@@ -84,10 +106,11 @@ def load_provider():
         if not callable(function):
             result[name] = None
             continue
-        actual = tuple(inspect.signature(function).parameters)
+        signature = _provider_signature(function, name)
+        actual = tuple(signature.parameters)
         if actual[:len(parameters)] != parameters:
             raise RuntimeError(f'HCU mHC provider signature changed: {name}: {actual}')
-        inspect.signature(function).bind(*([object()] * len(parameters)))
+        signature.bind(*([object()] * len(parameters)))
         result[name] = function
     return SimpleNamespace(**result)
 
