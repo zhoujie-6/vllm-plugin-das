@@ -146,6 +146,11 @@ def pre_supported(residual, fn, scale, base, pre_mix=None, x=None):
     if residual.ndim != 3 or residual.shape[1] != 4:
         return False
     tokens, hc, hidden = residual.shape
+    # The gfx938 AITER stage2 returns incorrect/non-repeatable combination
+    # matrices for the V4.1 odd-token H5120 shapes. Delegate this seam to
+    # the official Torch implementation; even prefill batches stay eligible.
+    if tokens % 2 == 1 and hidden == 5120:
+        return False
     tensors = [residual, fn, scale, base]
     if pre_mix is not None:
         if pre_mix.shape != (tokens, hc) or pre_mix.dtype != torch.float32:

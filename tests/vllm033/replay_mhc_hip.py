@@ -182,7 +182,7 @@ def main():
             for hidden in (1024,4096,5120,7168):
                 r,fn,s,b,pm,x,p,c=tensors(4,hidden=hidden,tokens=1)
                 CALLS.clear();pre(r,fn,s,b,1e-6,1e-6,1e-6,2.,3)
-                assert 'pre' in CALLS
+                assert ('pre' in CALLS)==(hidden!=5120)
                 CALLS.clear();post(x,r,p,c)
                 assert ('post' in CALLS)==(hidden!=5120)
             r,fn,s,b,pm,x,p,c=tensors(4,tokens=0)
