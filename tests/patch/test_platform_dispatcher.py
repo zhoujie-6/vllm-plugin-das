@@ -125,6 +125,10 @@ def test_platform_framework_inventory_is_explicit_and_dependency_ordered():
             "vllm.distributed.device_communicators.aiter_custom_all_reduce",
         ),
         (
+            "platform.framework_opt.auto_network",
+            "vllm.distributed.parallel_state",
+        ),
+        (
             "platform.framework_opt.pp_single_rank_partition",
             "vllm.distributed.utils",
         ),

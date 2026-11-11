@@ -16,6 +16,7 @@ from vllm_hcu.patch.tokenizer_callbacks import register_tokenizer_callbacks
 from .core_fix import register_platform_core_callbacks
 from .framework_opt import (
     patch_aiter_custom_all_reduce,
+    patch_auto_network,
     patch_engine_core,
     patch_distributed_utils,
     patch_kv_cache_coordinator,
@@ -52,6 +53,7 @@ _DISPATCH_LOCK = threading.RLock()
 # cache sizing while retaining the existing MTP group semantics.
 _ORDERED_FRAMEWORK_ADAPTERS = (
     patch_aiter_custom_all_reduce,
+    patch_auto_network,
     patch_distributed_utils,
     # Restore 0.25 TransferTopology KV-layout APIs before Mooncake validation.
     patch_kv_connector_utils,
