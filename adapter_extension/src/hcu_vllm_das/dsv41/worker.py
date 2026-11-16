@@ -18,7 +18,7 @@ def uses_pcp_channel_fp8(config):
         (p.tensor_parallel_size, p.data_parallel_size, p.pipeline_parallel_size,
          p.prefill_context_parallel_size, p.decode_context_parallel_size) == (1, 1, 1, 8, 1)
         and p.enable_expert_parallel
-        and cfg.model_config.quantization == "hcu_dsv41_channel_fp8"
+        and cfg.model_config.quantization in ("hcu_dsv41_channel_fp8", "hcu_dsv41_ct_w4a8")
         and cfg.kernel_config.moe_backend in ("deep_gemm_mega_moe", "deep_gemm")
         and _is_v41(cfg.model_config.hf_config)
     )

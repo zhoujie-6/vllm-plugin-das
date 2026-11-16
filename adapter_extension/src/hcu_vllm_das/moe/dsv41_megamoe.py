@@ -91,7 +91,7 @@ def make_buffer(mega, group, num_experts, capacity, topk, hidden, intermediate):
 
 
 @contextmanager
-def _layer_buffer(ep, mega, device, moe, capacity):
+def _layer_buffer(ep, mega, device, moe, capacity, mode="fp8"):
     """Publish a group's shared buffer only after its first layer loads."""
     cache = getattr(ep, "_hcu_dsv41_mega_buffers", None)
     if cache is None:
@@ -112,12 +112,15 @@ def _layer_buffer(ep, mega, device, moe, capacity):
 
     shape = (moe.num_experts, capacity, moe.experts_per_token,
              moe.hidden_dim, moe.intermediate_size_per_partition)
-    key = (device, *shape)
+    key = (device, mode, *shape)
     if key in cache:
         yield cache[key]
         return
 
-    buf = make_buffer(mega, ep.device_group, *shape)
+    if mode == "w4a8":
+        buf = mega.get_symm_buffer_for_mega_moe(ep.device_group, *shape, mode=mode)
+    else:
+        buf = make_buffer(mega, ep.device_group, *shape)
     try:
         yield buf
         cache[key] = buf
@@ -241,9 +244,15 @@ class MegaExperts(mk.FusedMoEExpertsModular):
             raise ValueError("MegaMoE per-rank token capacity exceeded")
         # No early return on an empty rank: peers still need its IPC barriers.
         if x.shape[0]:
-            self.mega.mega_moe_preprocess(
-                x.contiguous(), ids.to(torch.int64).contiguous(),
-                weights.float().contiguous(), self.buffer, x.shape[0])
+            self.stage(x, ids, weights)
+        self.launch(output)
+
+    def stage(self, x, ids, weights):
+        self.mega.mega_moe_preprocess(
+            x.contiguous(), ids.to(torch.int64).contiguous(),
+            weights.float().contiguous(), self.buffer, x.shape[0])
+
+    def launch(self, output):
         self.mega.fp8_mega_moe(
             output, self.l1, self.l2, self.buffer,
             activation_clamp=(self.quant_config.gemm1_clamp_limit
@@ -274,8 +283,10 @@ class MegaKernel(mk.FusedMoEKernel):
         return output
 
 
-class HcuDSV41MegaMoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
+class DSV41MegaMoEMethodMixin:
+    """Shared PCP constraints and post-load lifecycle for both CT methods."""
     supports_swa_bounded_replay = False
+
 
     def __init__(self, weight_quant, input_quant, moe, prefix):
         FusedMoEMethodBase.__init__(self, moe)
@@ -284,12 +295,9 @@ class HcuDSV41MegaMoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
                         supports_swa_bounded_replay=self.supports_swa_bounded_replay)
         self.buffer_capacity = profile_token_capacity(config, moe.pcp_size, moe.max_num_tokens)
         self.weight_quant, self.input_quant = weight_quant, input_quant
-        self.weight_block_size = None
-        self.block_quant = self.static_input_scales = False
         self._prefix = prefix
         self._processed = False
         self._failure = None
-        self.experts_cls = MegaExperts
 
     @property
     def supports_eplb(self):
@@ -298,13 +306,6 @@ class HcuDSV41MegaMoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
     def maybe_roundup_sizes(self, hidden_size, intermediate_size_per_partition,
                             act_dtype, moe_parallel_config):
         return hidden_size, intermediate_size_per_partition
-
-    def get_fused_moe_quant_config(self, layer):
-        from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
-        return FusedMoEQuantConfig.make(
-            torch.float8_e4m3fn, w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale, per_act_token_quant=True,
-            per_out_ch_quant=True, gemm1_clamp_limit=layer.swiglu_limit)
 
     def process_weights_after_loading(self, layer):
         if self._failure is not None:
@@ -315,6 +316,26 @@ class HcuDSV41MegaMoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
             if self._failure is None:
                 self._failure = "MegaMoE post-load failed; restart process"
             raise
+
+    def apply(self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input):
+        if self._failure is not None:
+            raise RuntimeError(self._failure)
+        return super().apply(layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input)
+
+
+class HcuDSV41MegaMoEMethod(DSV41MegaMoEMethodMixin, CompressedTensorsW8A8Fp8MoEMethod):
+    def __init__(self, weight_quant, input_quant, moe, prefix):
+        super().__init__(weight_quant, input_quant, moe, prefix)
+        self.weight_block_size = None
+        self.block_quant = self.static_input_scales = False
+        self.experts_cls = MegaExperts
+
+    def get_fused_moe_quant_config(self, layer):
+        from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+        return FusedMoEQuantConfig.make(
+            torch.float8_e4m3fn, w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale, per_act_token_quant=True,
+            per_out_ch_quant=True, gemm1_clamp_limit=layer.swiglu_limit)
 
     @torch.inference_mode()
     def _process_weights(self, layer):
@@ -358,8 +379,3 @@ class HcuDSV41MegaMoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
                     mega.__file__, self.moe.num_experts,
                     self.moe.num_local_experts, self.moe.experts_per_token,
                     buffer.num_max_tokens_per_rank)
-
-    def apply(self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input):
-        if self._failure is not None:
-            raise RuntimeError(self._failure)
-        return super().apply(layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input)
