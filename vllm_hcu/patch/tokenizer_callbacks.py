@@ -24,6 +24,8 @@ from .import_coordinator import (
 )
 
 TARGET_MODULE = "vllm.tokenizers.hf"
+DSV4_MODULE = "vllm.tokenizers.deepseek_v4"
+DSV4_PATCH_ID = "post_import.tokenizer.deepseek_v4_default_low_effort"
 KIMI_PATCH_ID = "post_import.tokenizer.kimi_k25_regex"
 DEEPSEEK_PATCH_ID = "post_import.tokenizer.deepseek_r1_distill_llama_70b"
 _KIMI_MARKER = "_hcu_kimi_k25_regex_patch_applied"
@@ -326,10 +328,40 @@ def apply_deepseek_distill_tokenizer(module: ModuleType) -> bool:
     return True
 
 
+def apply_deepseek_v4_default_effort(module: ModuleType) -> bool:
+    """Default the V4 chat template to low effort on HCU."""
+    target = require_exact_module(module, DSV4_MODULE)
+    factory = require_callable(
+        target, "get_deepseek_v4_tokenizer", f"{DSV4_MODULE}.get_deepseek_v4_tokenizer"
+    )
+    if getattr(factory, "_hcu_dsv4_default_low_effort", False):
+        return False
+
+    @functools.wraps(factory)
+    def get_deepseek_v4_tokenizer(tokenizer):
+        wrapped = factory(tokenizer)
+        # vLLM creates a private wrapper class for each tokenizer instance.
+        wrapper_cls = type(wrapped)
+        apply_template = wrapper_cls.apply_chat_template
+
+        @functools.wraps(apply_template)
+        def apply_chat_template(self, *args, **kwargs):
+            if kwargs.get("reasoning_effort") is None:
+                kwargs["reasoning_effort"] = "low"
+            return apply_template(self, *args, **kwargs)
+
+        wrapper_cls.apply_chat_template = apply_chat_template
+        return wrapped
+
+    get_deepseek_v4_tokenizer._hcu_dsv4_default_low_effort = True
+    target.get_deepseek_v4_tokenizer = get_deepseek_v4_tokenizer
+    return True
+
+
 def register_tokenizer_callbacks(
     coordinator: ExactImportCoordinator = IMPORT_COORDINATOR,
 ) -> tuple[ImportRegistration, ...]:
-    """Register both wrappers in deterministic legacy-compatible order."""
+    """Register the tokenizer callbacks in deterministic order."""
 
     kimi = coordinator.register_callback(
         KIMI_PATCH_ID,
@@ -346,7 +378,13 @@ def register_tokenizer_callbacks(
             "vllm.tokenizers.hf.get_cached_tokenizer",
         ),
     )
-    return kimi, deepseek
+    dsv4 = coordinator.register_callback(
+        DSV4_PATCH_ID,
+        DSV4_MODULE,
+        apply_deepseek_v4_default_effort,
+        targets=f"{DSV4_MODULE}.get_deepseek_v4_tokenizer",
+    )
+    return kimi, deepseek, dsv4
 
 
 __all__ = [

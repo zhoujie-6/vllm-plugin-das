@@ -22,6 +22,7 @@ from vllm_hcu.patch.runtime_state import (
 )
 from vllm_hcu.patch.tokenizer_callbacks import (
     DEEPSEEK_PATCH_ID,
+    DSV4_MODULE,
     KIMI_PATCH_ID,
     TARGET_MODULE,
     apply_deepseek_distill_tokenizer,
@@ -203,12 +204,13 @@ def test_callbacks_apply_immediately_to_loaded_module_and_repeat_registration(
     registry = PatchRegistry()
     coordinator = ExactImportCoordinator(registry=registry)
 
+    monkeypatch.delitem(sys.modules, DSV4_MODULE, raising=False)
     first = register_tokenizer_callbacks(coordinator)
     second = register_tokenizer_callbacks(coordinator)
 
-    assert [item.status for item in first] == ["applied", "applied"]
-    assert [item.status for item in second] == ["applied", "applied"]
-    assert len(coordinator.registrations()) == 2
+    assert [item.status for item in first] == ["applied", "applied", "armed"]
+    assert [item.status for item in second] == ["applied", "applied", "armed"]
+    assert len(coordinator.registrations()) == 3
     assert getattr(tokenizer_class, "_hcu_kimi_k25_regex_patch_applied")
     assert getattr(
         tokenizer_class,
@@ -253,8 +255,9 @@ def test_callbacks_arm_before_module_load_and_run_on_exact_import(
     monkeypatch.delitem(sys.modules, TARGET_MODULE, raising=False)
     registry = PatchRegistry()
     coordinator = ExactImportCoordinator(registry=registry)
+    monkeypatch.delitem(sys.modules, DSV4_MODULE, raising=False)
     registrations = register_tokenizer_callbacks(coordinator)
-    assert [item.status for item in registrations] == ["armed", "armed"]
+    assert [item.status for item in registrations] == ["armed", "armed", "armed"]
 
     coordinator.install()
     finder = _TokenizerFinder()
@@ -461,3 +464,29 @@ def test_step_repo_id_resolves_real_offline_hub_snapshot(
         download_dir=str(cache),
         local_files_only=True,
     )
+
+
+def test_deepseek_v4_defaults_to_low_effort_and_preserves_request_overrides():
+    from vllm.tokenizers.deepseek_v4 import get_deepseek_v4_tokenizer
+
+    class Tokenizer:
+        def get_added_vocab(self):
+            return {}
+
+    module = ModuleType(DSV4_MODULE)
+    module.get_deepseek_v4_tokenizer = get_deepseek_v4_tokenizer
+    tokenizer_callbacks.apply_deepseek_v4_default_effort(module)
+    assert not tokenizer_callbacks.apply_deepseek_v4_default_effort(module)
+    tokenizer = module.get_deepseek_v4_tokenizer(Tokenizer())
+    messages = [{"role": "user", "content": "Hello"}]
+
+    def render(**kwargs):
+        return tokenizer.apply_chat_template(messages, tokenize=False, **kwargs)
+
+    default = render()
+    assert default == render(reasoning_effort="low") == render(reasoning_effort=None)
+    assert default.endswith("<think>") and "Reasoning Effort:" not in default
+    assert "Reasoning Effort: Absolute maximum" in render(reasoning_effort="high")
+    assert "Reasoning Effort: Beyond maximum" in render(reasoning_effort="max")
+    assert render(thinking=False).endswith("</think>")
+    assert render(enable_thinking=False) == render(reasoning_effort="none")
