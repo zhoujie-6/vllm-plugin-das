@@ -54,12 +54,7 @@ class W4A8MegaExperts(MegaExperts):
             w4a8_scales_predivided=True)
 
 
-class HcuDSV41W4A8MegaMoEMethod(DSV41MegaMoEMethodMixin, CompressedTensorsW4A8Int8MoEMethod):
-    def __init__(self, weight_quant, input_quant, moe, prefix):
-        super().__init__(weight_quant, input_quant, moe, prefix)
-        self.experts_cls = W4A8MegaExperts
-        self.mega = w4a8_provider()
-
+class DSV41W4A8Method(DSV41MegaMoEMethodMixin, CompressedTensorsW4A8Int8MoEMethod):
     def create_weights(self, layer, num_experts, hidden_size,
                        intermediate_size_per_partition, params_dtype, **extra_weight_attrs):
         for name, n, k in (("w13", 2 * intermediate_size_per_partition, hidden_size),
@@ -81,6 +76,13 @@ class HcuDSV41W4A8MegaMoEMethod(DSV41MegaMoEMethodMixin, CompressedTensorsW4A8In
             torch.int8, weight_dtype="int4", per_act_token_quant=True, per_out_ch_quant=True,
             w1_scale=layer.w13_weight_scale, w2_scale=layer.w2_weight_scale,
             gemm1_clamp_limit=layer.swiglu_limit)
+
+
+class HcuDSV41W4A8MegaMoEMethod(DSV41W4A8Method):
+    def __init__(self, weight_quant, input_quant, moe, prefix):
+        super().__init__(weight_quant, input_quant, moe, prefix)
+        self.experts_cls = W4A8MegaExperts
+        self.mega = w4a8_provider()
 
     @torch.inference_mode()
     def _process_weights(self, layer):
