@@ -119,7 +119,10 @@ class HcuDSV41CTW4A8Config(CompressedTensorsConfig):
         if not _schema(s.get('weights'),s.get('input_activations')):
             return super().get_quant_method(layer,prefix)
         if s.get('format')!='pack-quantized': raise ValueError('HCU W4A8 requires pack-quantized weights')
-        if layer.moe_config.moe_backend in ("deep_gemm_mega_moe", "deep_gemm"):
+        if (layer.moe_config.moe_backend == "deep_gemm_mega_moe"
+                or (layer.moe_config.moe_backend == "deep_gemm"
+                    and layer.moe_config.pcp_size == 8
+                    and layer.moe_config.ep_size == 8)):
             from .dsv41_channel_w4a8 import _channel_w4a8
             if not _channel_w4a8(s):
                 raise ValueError("DSV4.1 MegaMoE requires symmetric channel INT4 and token INT8")

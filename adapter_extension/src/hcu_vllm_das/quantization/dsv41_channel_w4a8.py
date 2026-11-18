@@ -18,4 +18,3 @@ def _channel_w4a8(scheme):
         and _field(act, "strategy") == "token" and _field(act, "dynamic") is True
         and _field(act, "symmetric") is True and not scheme.get("output_activations")
     )
-

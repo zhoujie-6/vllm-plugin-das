@@ -56,3 +56,52 @@ def test_schema_requires_symmetric_token_and_channel():
     assert not cfg._channel_w4a8(dict(s, weights=dict(w, strategy="group")))
     assert not cfg._channel_w4a8(dict(s, input_activations=dict(a, symmetric=False)))
     assert not cfg._channel_w4a8(dict(s, format="int-quantized"))
+
+
+
+@pytest.mark.parametrize("backend", ["deep_gemm_mega_moe", "deep_gemm"])
+def test_registered_ct_config_routes_pcp8_w4a8(monkeypatch, backend):
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from hcu_vllm_das import ct_w4a8_activation
+    from hcu_vllm_das.quantization import ct_w4a8
+    from hcu_vllm_das.moe import dsv41_w4a8_deepgemm as grouped
+
+    monkeypatch.setattr(ct_w4a8_activation, "check_health", lambda: None)
+    config = object.__new__(ct_w4a8.HcuDSV41CTW4A8Config)
+    config.target_scheme_map = {}
+    weights = dict(type="int", num_bits=4, symmetric=True, strategy="channel")
+    activations = dict(type="int", num_bits=8, symmetric=True, strategy="token", dynamic=True)
+    scheme = dict(weights=weights, input_activations=activations, format="pack-quantized")
+    monkeypatch.setattr(config, "get_scheme_dict", lambda *args: scheme)
+    layer = object.__new__(RoutedExperts)
+    torch.nn.Module.__init__(layer)
+    layer.moe_config = NS(moe_backend=backend, pcp_size=8, ep_size=8)
+    layer.ckpt_gate_proj_name = "gate_proj"
+    layer.ckpt_up_proj_name = "up_proj"
+    layer.ckpt_down_proj_name = "down_proj"
+    calls = []
+    expected = object()
+    def construct(*args):
+        calls.append(args)
+        return expected
+    owner, name = ((w4, "HcuDSV41W4A8MegaMoEMethod") if backend == "deep_gemm_mega_moe"
+                   else (grouped, "HcuDSV41W4A8DeepGemmMethod"))
+    monkeypatch.setattr(owner, name, construct)
+    assert config.get_quant_method(layer, "model.layers.0.mlp.experts") is expected
+    assert calls == [(weights, activations, layer.moe_config, "model.layers.0.mlp.experts")]
+    assert cfg.HcuDSV41ChannelW4A8Config is ct_w4a8.HcuDSV41CTW4A8Config
+
+
+@pytest.mark.parametrize("backend", ["deep_gemm_mega_moe", "deep_gemm"])
+def test_w4a8_keeps_local_pcp_profile(backend):
+    from hcu_vllm_das.dsv41.worker import uses_pcp_channel_fp8
+    config = NS(parallel_config=NS(
+        tensor_parallel_size=1, data_parallel_size=1, pipeline_parallel_size=1,
+        prefill_context_parallel_size=8, decode_context_parallel_size=1,
+        enable_expert_parallel=True),
+        model_config=NS(quantization="hcu_dsv41_ct_w4a8",
+                        hf_config=NS(model_type="deepseek_v41")),
+        kernel_config=NS(moe_backend=backend))
+    assert uses_pcp_channel_fp8(config)
+    config.parallel_config.prefill_context_parallel_size = 1
+    assert not uses_pcp_channel_fp8(config)
