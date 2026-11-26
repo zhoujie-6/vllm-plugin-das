@@ -11,74 +11,40 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a8_int8 import (
     CompressedTensorsW4A8Int8MoEMethod,
 )
-from vllm.model_executor.layers.quantization.utils.int8_utils import _per_token_quant_int8
-from vllm.triton_utils import tl, triton
 from vllm.model_executor.layers.quantization.utils.quant_utils import kInt4Static, kInt8DynamicTokenSym
 from vllm.model_executor.utils import set_weight_attrs
 
 from ..dsv41.profile_worker import local_token_bound
-from ..quantization.ct_w4a8_weights import PackedCTParameters
+from ..quantization.ct_w4a8_weights import PackedCTParameters, convert_ct_int4_to_hipc_bytes_
 from .dsv41_megamoe import (
     DSV41MegaMoEMethodMixin, MegaExperts, MegaKernel, MegaPrepare, _layer_buffer,
 )
 
 
 def w4a8_provider():
-    import inspect
-    import deepgemm.mega as mega
+    import megamoe
+    from megamoe import w4a8
 
-    native = getattr(mega._C, "w4a8_mega_moe", None)
-    if not callable(native):
-        raise RuntimeError("DeepGEMM must provide the native W4A8 MegaMoE entry")
-    # Persistent, pre-divided scales avoid the vendor's legacy temporary-scale
-    # path, which synchronizes the host before releasing those temporaries.
-    if any(name not in (native.__doc__ or "") for name in
-           ("l1_weights_sf_div16", "l2_weights_sf_div16")):
-        raise RuntimeError("DeepGEMM W4A8 requires persistent pre-divided scales")
-    if "per_token_intermediate" not in (native.__doc__ or ""):
-        raise RuntimeError("DeepGEMM must support CT per-token intermediate quantization")
-    for name, args in (
-        ("transform_weights_for_mega_moe", (None, None)),
-        ("mega_moe_preprocess", (None, None, None, None, 0)),
-    ):
-        inspect.signature(getattr(mega, name)).bind(*args, mode="w4a8")
-    return mega
+    if not callable(getattr(w4a8, "w4a8_mega_moe", None)):
+        raise RuntimeError("The standalone MegaMoE wheel must support W4A8")
+    return megamoe
 
 
-def unpack_ct_words(words):
-    """CT packs the earliest unsigned offset-binary nibble in the low bits."""
-    if words.dtype != torch.int32:
-        raise ValueError("Expected INT32 compressed-tensors weight_packed")
-    pairs = words.contiguous().view(torch.uint8)
-    return (torch.stack((pairs & 15, pairs >> 4), dim=-1).flatten(-2) ^ 8)
+def pack_ct_hipc(words):
+    from deepgemm import pack_w4a8_moe_hipc_weight
 
-
-@triton.jit
-def _stage_ct_w4a8(x, q, sf, ids, weights, out_ids, out_weights,
-                   x_stride, id_row, id_col, weight_row, weight_col,
-                   hidden: tl.constexpr, topk: tl.constexpr,
-                   block: tl.constexpr, route_block: tl.constexpr):
-    # Inline Core's exact token quantizer and write directly into the IPC view.
-    _per_token_quant_int8(x, q, sf, x_stride, hidden, hidden, BLOCK=block)
-    row = tl.program_id(0)
-    k = tl.arange(0, route_block)
-    expert = tl.load(ids + row * id_row + k * id_col, mask=k < topk, other=-1)
-    route = tl.load(weights + row * weight_row + k * weight_col, mask=k < topk, other=0)
-    tl.store(out_ids + row * topk + k, expert, mask=k < topk)
-    tl.store(out_weights + row * topk + k, route, mask=k < topk)
+    return pack_w4a8_moe_hipc_weight(convert_ct_int4_to_hipc_bytes_(words))
 
 
 def stage_ct_w4a8(buf, x, ids, weights):
-    if x.stride(-1) != 1:
-        x = x.contiguous()
-    rows, hidden = x.shape
-    topk = ids.shape[1]
-    block = triton.next_power_of_2(hidden)
-    _stage_ct_w4a8[(rows,)](
-        x, buf.x, buf.x_sf, ids, weights, buf.topk_idx, buf.topk_weights,
-        x.stride(0), *ids.stride(), *weights.stride(), hidden, topk,
-        block, triton.next_power_of_2(topk),
-        num_warps=min(max(block // 256, 1), 8), num_stages=1)
+    from lightop.quant import per_token_quant_int8
+
+    rows = x.shape[0]
+    quantized, scales = per_token_quant_int8(x.contiguous())
+    buf.x[:rows].copy_(quantized)
+    buf.x_sf[:rows].copy_(scales.reshape(-1))
+    buf.topk_idx[:rows].copy_(ids)
+    buf.topk_weights[:rows].copy_(weights)
 
 
 class W4A8MegaExperts(MegaExperts):
@@ -110,18 +76,11 @@ class W4A8MegaExperts(MegaExperts):
         stage_ct_w4a8(self.buffer, x, ids, weights)
 
     def launch(self, output):
-        # Use the vendor's existing native ABI; no private Python wrapper
-        # extensions or per-forward scale-cache allocations are required.
-        buf = self.buffer
-        native = self.mega._C.w4a8_mega_moe
-        args = (
-            output, self.l1[0], self.l2[0], self.l1[1], self.l2[1],
-            buf.buffer, buf.local_buffer, buf.handle.buffer_ptrs,
-            buf.handle.signal_ptrs, buf.group.rank(),
-            buf.num_max_tokens_per_rank, buf.num_experts, buf.num_topk,
-            self.quant_config.gemm1_clamp_limit, True, self.l1[1], self.l2[1],
+        self.mega.w4a8.w4a8_mega_moe(
+            output, self.l1, self.l2, self.buffer,
+            activation_clamp=self.quant_config.gemm1_clamp_limit,
+            combine_group_map=self.combine_groups,
         )
-        native(*args, per_token_intermediate=True)
 
 
 class _MegaMoEPackedParameters(PackedCTParameters):
@@ -226,27 +185,30 @@ class HcuDSV41W4A8MegaMoEMethod(DSV41MegaMoEMethodMixin, CompressedTensorsW4A8In
                 raise ValueError("Unexpected DSV4.1 checkpoint expert weight_shape")
         self._packed.state = "packing"
         w1, w2 = layer.w13_weight_packed, layer.w2_weight_packed
-        # Reuse checkpoint storage, expanding just one local expert at a time.
+        # Repack each local expert in checkpoint storage.
         p1, p2 = w1.data.view(torch.int8), w2.data.view(torch.int8)
         s1 = layer.w13_weight_scale.data.squeeze(-1)
         s2 = layer.w2_weight_scale.data.squeeze(-1)
         for idx in range(w1.shape[0]):
             row = slice(idx, idx + 1)
-            l1, l2 = self.mega.transform_weights_for_mega_moe(
-                (unpack_ct_words(w1[row]), s1[row]),
-                (unpack_ct_words(w2[row]), s2[row]), mode="w4a8")
-            p1[row].copy_(l1[0])
-            p2[row].copy_(l2[0])
-            s1[row].copy_(l1[1])
-            s2[row].copy_(l2[1])
-        s1.div_(16)
-        s2.div_(16)
+            p1[row].copy_(pack_ct_hipc(w1[row]))
+            p2[row].copy_(pack_ct_hipc(w2[row]))
+        # The standalone wheel accepts natural gate/up order and true per-channel scales.
         # Keep the registered parameters used by Core's native CT W4A8 apply.
         w1.data, w2.data = p1, p2
         quant = self.get_fused_moe_quant_config(layer)
         self.moe_quant_config = quant
         with _layer_buffer(ep, self.mega, w1.device, self.moe, self.buffer_capacity, "w4a8") as buf:
             experts = W4A8MegaExperts(self.moe, quant, buf, (p1, s1), (p2, s2), self.mega)
+            placement = getattr(layer, "_hcu_static_eplb_row", None)
+            experts.combine_groups = None
+            if placement is not None:
+                logical = self.moe.num_logical_experts
+                if logical % ep.world_size or len(placement) != self.moe.num_experts:
+                    raise ValueError("Static expert placement is incompatible with EP groups")
+                owners = [index // (logical // ep.world_size) for index in placement]
+                if any(owner != index // p1.shape[0] for index, owner in enumerate(owners)):
+                    experts.combine_groups = torch.tensor(owners, dtype=torch.int32, device=p1.device)
             self.moe_kernel = MegaKernel(MegaPrepare(), experts)
             self._packed.state = "ready"
             self._processed = True

@@ -34,13 +34,29 @@ def _reserve_attention_workspace(runner):
         current_workspace_manager().get_simultaneous(*largest_shapes)
 
 
+def _segment_allocator_library():
+    import torch
+    from pathlib import Path
+    from torch.utils.cpp_extension import ROCM_HOME, include_paths, library_paths
+    from triton.runtime.build import compile_so_from_file
+
+    source = Path(__file__).resolve().parents[1] / "csrc" / "hip_segment_allocator.cpp"
+    return compile_so_from_file(
+        str(source), "hcu_dsv41_hip_segment_allocator",
+        include_dirs=include_paths("cuda"),
+        library_dirs=[*library_paths("cuda"), str(Path(ROCM_HOME) / "hip/lib")],
+        libraries=["c10", "c10_hip", "galaxyhip"],
+        ccflags=["-std=c++17", "-D__HIP_PLATFORM_AMD__=1",
+                 f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}"],
+    )
+
+
 def configure_forward_pool(context):
     cfg = context.vllm_config
     if (cfg.model_config.quantization != "hcu_dsv41_ct_w4a8"
             or cfg.kernel_config.moe_backend != "deep_gemm_mega_moe"):
         return
     import torch
-    from deepgemm.mega import _C
     from vllm.logger import init_logger
 
     runner = context.worker.model_runner
@@ -49,7 +65,7 @@ def configure_forward_pool(context):
     if torch.cuda.get_allocator_backend() != "native":
         raise RuntimeError("DSV4.1 cached HIP segments require the native PyTorch allocator")
     allocator = torch.cuda.memory.CUDAPluggableAllocator(
-        _C.__file__, "dsv41_hip_segment_alloc", "dsv41_hip_segment_free",
+        _segment_allocator_library(), "dsv41_hip_segment_alloc", "dsv41_hip_segment_free",
     )
 
     def new_pool():

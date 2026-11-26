@@ -133,7 +133,7 @@ def _layer_buffer(ep, mega, device, moe, capacity, mode="fp8"):
         return
 
     if mode == "w4a8":
-        buf = mega.get_symm_buffer_for_mega_moe(ep.device_group, *shape, mode=mode)
+        buf = mega.get_symm_buffer_for_mega_moe(ep.device_group, *shape, quant_mode=mode)
     else:
         buf = make_buffer(mega, ep.device_group, *shape)
     try:

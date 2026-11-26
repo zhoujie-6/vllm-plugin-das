@@ -171,7 +171,6 @@ def test_megamoe_static_dspark_replay_uses_existing_layer_split(monkeypatch):
 
 def test_forward_pool_profiles_full_batch_and_releases_segments(monkeypatch):
     from contextlib import contextmanager
-    import sys
     import torch
     from hcu_vllm_das.moe import dsv41_forward_pool as fp
 
@@ -188,7 +187,7 @@ def test_forward_pool_profiles_full_batch_and_releases_segments(monkeypatch):
         yield
         events.append(("exit", pool))
 
-    monkeypatch.setitem(sys.modules, "deepgemm.mega", NS(_C=NS(__file__="provider.so")))
+    monkeypatch.setattr(fp, "_segment_allocator_library", lambda: "allocator.so")
     monkeypatch.setattr(torch.cuda.memory, "CUDAPluggableAllocator",
                         lambda *a: NS(allocator=lambda: "segments"))
     monkeypatch.setattr(torch.cuda, "get_allocator_backend", lambda: "native")

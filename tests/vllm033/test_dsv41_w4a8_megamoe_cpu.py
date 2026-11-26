@@ -4,10 +4,12 @@ import pytest
 import torch
 from hcu_vllm_das.moe import dsv41_w4a8_megamoe as w4
 
-def test_ct_nibbles_across_int32_sign_bit():
-    word = torch.tensor([0x76543210, -0x1234568], dtype=torch.int32)
-    assert w4.unpack_ct_words(word).tolist() == [
-        8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7]
+def test_ct_nibbles_across_int32_sign_bit(monkeypatch):
+    import deepgemm
+    monkeypatch.setattr(deepgemm, "pack_w4a8_moe_hipc_weight", lambda x: x)
+    words = torch.tensor([0x76543210, -0x1234568], dtype=torch.int32)
+    assert w4.pack_ct_hipc(words.view(1, 1, 2)).view(torch.uint8).flatten().tolist() == [
+        0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67]
 
 
 @pytest.mark.parametrize("rows", [0, 1, 5])
@@ -35,15 +37,15 @@ def test_uneven_local_batch_launches_clamped_w4a8(monkeypatch, rows):
                    topk_weights=torch.zeros(6, 2), buffer=object(), local_buffer=object(),
                    handle=NS(buffer_ptrs=[1], signal_ptrs=[2]),
                    group=NS(rank=lambda: 0), num_experts=4, num_topk=2)
-    ex.mega = NS(_C=NS(w4a8_mega_moe=lambda *a, **kw: calls.append((a, kw))))
+    ex.combine_groups = object()
+    ex.mega = NS(w4a8=NS(w4a8_mega_moe=lambda *a, **kw: calls.append((a, kw))))
     out = torch.empty_like(x)
     ex.run(out, x, ids, weights)
     assert len(calls) == 1
     args, kw = calls[0]
-    assert args[0].shape == out.shape and args[0].data_ptr() == out.data_ptr() and args[5] is ex.buffer.buffer
-    assert args[13:15] == (10., True)
-    assert args[15] is ex.l1[1] and args[16] is ex.l2[1]
-    assert len(args) == 17 and kw == {"per_token_intermediate": True}
+    assert args[0].shape == out.shape and args[0].data_ptr() == out.data_ptr()
+    assert args[1:] == (ex.l1, ex.l2, ex.buffer)
+    assert kw == {"activation_clamp": 10., "combine_group_map": ex.combine_groups}
     assert torch.equal(ex.buffer.x[:rows], q)
     assert torch.equal(ex.buffer.x_sf[:rows], sf.flatten())
     assert torch.equal(ex.buffer.topk_idx[:rows], ids)
@@ -51,32 +53,18 @@ def test_uneven_local_batch_launches_clamped_w4a8(monkeypatch, rows):
     assert torch.all(ex.buffer.topk_idx[rows:] == -1)
 
 
-@pytest.mark.parametrize("abi, error", [
-    (None, "native W4A8"),
-    ("legacy ABI", "pre-divided"),
-    ("l1_weights_sf_div16 l2_weights_sf_div16", "per-token"),
-    ("l1_weights_sf_div16 l2_weights_sf_div16 per_token_intermediate", None),
-])
-def test_provider_uses_upstream_abi_without_private_flags(monkeypatch, abi, error):
+@pytest.mark.parametrize("available", [False, True])
+def test_provider_requires_standalone_w4a8(monkeypatch, available):
     import sys
     from types import ModuleType
-    package = ModuleType("deepgemm")
-    package.__path__ = []
-    mega = ModuleType("deepgemm.mega")
-    def native(*args):
-        pass
-    native.__doc__ = abi
-    mega._C = NS(w4a8_mega_moe=None if abi is None else native)
-    mega.transform_weights_for_mega_moe = lambda a, b, mode="w8a8": None
-    mega.mega_moe_preprocess = lambda a, b, c, d, e, mode="w8a8": None
-    package.mega = mega
-    monkeypatch.setitem(sys.modules, "deepgemm", package)
-    monkeypatch.setitem(sys.modules, "deepgemm.mega", mega)
-    if error is not None:
-        with pytest.raises(RuntimeError, match=error):
-            w4.w4a8_provider()
+    package = ModuleType("megamoe")
+    package.w4a8 = NS(w4a8_mega_moe=(lambda *args: None) if available else None)
+    monkeypatch.setitem(sys.modules, "megamoe", package)
+    if available:
+        assert w4.w4a8_provider() is package
     else:
-        assert w4.w4a8_provider() is mega
+        with pytest.raises(RuntimeError, match="standalone"):
+            w4.w4a8_provider()
 
 
 def test_registered_ct_config_routes_w4a8_megamoe(monkeypatch):
@@ -147,8 +135,8 @@ def test_w4a8_requires_loaded_state_before_packing(state):
     assert not method._processed
 
 
-def test_actual_provider_has_async_w4a8_scale_abi():
-    assert w4.w4a8_provider().__name__ == "deepgemm.mega"
+def test_actual_provider_has_standalone_w4a8_entry():
+    assert w4.w4a8_provider().__name__ == "megamoe"
     assert not torch.cuda.is_initialized()
 
 @pytest.mark.parametrize("rows,expected", [(0, [0, 0, 0]), (6, [4, 2, 0]), (10, [4, 4, 2])])
@@ -170,44 +158,6 @@ def test_replay_tiles_follow_common_pcp_extent(monkeypatch, rows, expected):
     ex.run(out, x, x, x)
     assert seen == expected
     assert torch.equal(out, x)
-
-
-def test_gemm2_uses_provider_scale_order(monkeypatch):
-    from contextlib import nullcontext
-
-    # Give each channel and each expert a distinct checkpoint scale.
-    hidden, intermediate = 16, 8
-    scales = torch.arange(1, 33, dtype=torch.float32).reshape(2, hidden, 1)
-    layer = NS(
-        apply_router_weight_on_input=False, swiglu_limit=10.0,
-        expert_map_manager=NS(num_fused_shared_experts=0),
-        w13_weight_shape=torch.tensor([[intermediate, hidden]] * 2),
-        w2_weight_shape=torch.tensor([[hidden, intermediate]] * 2),
-        w13_weight_packed=torch.zeros(2, 2 * intermediate, hidden // 8, dtype=torch.int32),
-        w2_weight_packed=torch.zeros(2, hidden, intermediate // 8, dtype=torch.int32),
-        w13_weight_scale=torch.ones(2, 2 * intermediate, 1),
-        w2_weight_scale=scales.clone(),
-    )
-
-    def transform(l1, l2, mode):
-        assert mode == "w4a8"
-        w1, s1 = l1
-        w2, s2 = l2
-        return (w1[..., ::2], s1), (w2[..., ::2], s2.flip(-1))
-
-    method = NS(_processed=False, _prefix="layers.7", buffer_capacity=1,
-                _packed=NS(state="loaded", require_complete=lambda prefix: None),
-                moe=NS(hidden_dim=hidden, intermediate_size_per_partition=intermediate, ep_size=2),
-                mega=NS(transform_weights_for_mega_moe=transform),
-                get_fused_moe_quant_config=lambda layer: None)
-    monkeypatch.setattr(w4, "get_ep_group", lambda: NS(world_size=2, rank_in_group=1))
-    monkeypatch.setattr(w4, "_layer_buffer", lambda *args: nullcontext(None))
-    monkeypatch.setattr(w4, "W4A8MegaExperts", lambda moe, quant, buf, l1, l2, mega: l2)
-    monkeypatch.setattr(w4, "MegaKernel", lambda prepare, experts: experts)
-
-    w4.HcuDSV41W4A8MegaMoEMethod._process_weights(method, layer)
-    _, kernel_scales = method.moe_kernel
-    torch.testing.assert_close(kernel_scales, scales.squeeze(-1).flip(-1) / 16)
 
 
 @pytest.mark.parametrize("shard,projection", [("w1", "gate"), ("w3", "up"), ("w2", "down")])
@@ -237,7 +187,8 @@ def _load_checkpoint(monkeypatch, *, omit=None, static=False):
     method.moe_kernel, method.buffer_capacity = None, 1
     layer.quant_method = method
     layer.apply_router_weight_on_input, layer.swiglu_limit = False, 10.0
-    method.moe = NS(hidden_dim=512, intermediate_size_per_partition=256, ep_size=2)
+    method.moe = NS(hidden_dim=512, intermediate_size_per_partition=256, ep_size=2,
+                    num_logical_experts=4, num_experts=6)
     method.create_weights(layer, 3, 512, 256, torch.bfloat16, weight_loader=layer.weight_loader)
     if static:
         # Logical expert 1 has two replicas on this rank (physical 3 and 5).
@@ -270,13 +221,12 @@ def _load_checkpoint(monkeypatch, *, omit=None, static=False):
                         continue
                 param.weight_loader(param, data, name, shard_id=shard, expert_id=expert)
 
-    def transform(l1, l2, mode):
-        return [(weights[..., ::2].to(torch.int8), scales) for weights, scales in (l1, l2)]
-
-    method.mega = NS(transform_weights_for_mega_moe=transform)
+    import deepgemm
+    monkeypatch.setattr(deepgemm, "pack_w4a8_moe_hipc_weight", lambda data: data)
+    method.mega = NS()
     monkeypatch.setattr(w4, "get_ep_group", lambda: NS(world_size=2, rank_in_group=1))
     monkeypatch.setattr(w4, "_layer_buffer", lambda *args: nullcontext(None))
-    monkeypatch.setattr(w4, "W4A8MegaExperts", lambda moe, quant, buf, l1, l2, mega: (l1, l2))
+    monkeypatch.setattr(w4, "W4A8MegaExperts", lambda moe, quant, buf, l1, l2, mega: NS(l1=l1, l2=l2))
     monkeypatch.setattr(w4, "MegaKernel", lambda prepare, experts: experts)
     return layer, method
 
@@ -293,14 +243,18 @@ def test_complete_checkpoint_packs_local_experts(monkeypatch, static, experts):
     layer, method = _load_checkpoint(monkeypatch, static=static)
     method.process_weights_after_loading(layer)
     assert method._packed.state == "ready" and method._processed
-    (w13, s13), (w2, s2) = method.moe_kernel
+    (w13, s13), (w2, s2) = method.moe_kernel.l1, method.moe_kernel.l2
+    if static:
+        assert method.moe_kernel.combine_groups.tolist() == [0, 1, 1, 0, 0, 0]
+    else:
+        assert method.moe_kernel.combine_groups is None
     for slot, expert in enumerate(experts):
         for weights, scales, offset in [(w13[slot, :256], s13[slot, :256], 1),
                                         (w13[slot, 256:], s13[slot, 256:], 3),
                                         (w2[slot], s2[slot], 2)]:
             value = (expert + offset) % 8
-            assert torch.all(weights == (value ^ 8))
-            assert torch.all(scales == value / 16)
+            assert torch.all(weights.view(torch.uint8) == (value ^ 8) * 0x11)
+            assert torch.all(scales == value)
 
 
 def test_full_local_tensor_load_fills_all_expert_slots(monkeypatch):
@@ -309,5 +263,5 @@ def test_full_local_tensor_load_fills_all_expert_slots(monkeypatch):
     rows = torch.arange(1, 4, dtype=scales.dtype).view(3, 1, 1).expand_as(scales)
     assert scales.weight_loader(scales, rows, "w2_weight_scale", "w2", 3, True)
     method.process_weights_after_loading(layer)
-    _, (_, packed_scales) = method.moe_kernel
-    torch.testing.assert_close(packed_scales, rows.squeeze(-1) / 16)
+    _, packed_scales = method.moe_kernel.l2
+    torch.testing.assert_close(packed_scales, rows.squeeze(-1))
