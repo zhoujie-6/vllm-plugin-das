@@ -120,6 +120,24 @@ class PrefillPages:
     swa_replay_by_prefix: dict = field(default_factory=dict)
     replay_layers: object | None = None
 
+    local_swa_write: tuple[str, object] | None = None
+
+    def can_fill_swa(self, prefix, metadata):
+        # Only independent SWA pools with known fresh pages are registered.
+        # The replay cut reads a halo written by the separate full-batch KV
+        # pass. Its compact insert alone cannot populate that halo.
+        if prefix not in self.by_prefix or not prefix.endswith('.swa_cache'):
+            return False
+        layers = self.replay_layers
+        replay = None if layers is None else layers.replay_batch
+        if replay is not None and metadata is replay.forward_context.attn_metadata:
+            return prefix != layers.first_swa_prefix and prefix in self.swa_replay_by_prefix
+        return True
+
+    def take_local_swa(self, prefix, metadata):
+        entry, self.local_swa_write = self.local_swa_write, None
+        return entry is not None and entry[0] == prefix and entry[1] is metadata
+
     def ids(self, prefix, metadata):
         replay = None if self.replay_layers is None else self.replay_layers.replay_batch
         if (prefix.endswith('.swa_cache') and replay is not None

@@ -10,6 +10,7 @@ from functools import cache
 from vllm.forward_context import get_forward_context, override_forward_context
 from vllm.models.deepseek_v41.attention import DeepseekV4Attention
 from hcu_adapter.kernels import pcp_fork
+from .dsa_prefill_pages import active_prefill_pages
 from .dsa_cache_layer_split import (
     _prefix_owner_rank, broadcast_kv_source_cache,
     layer_split_state, record_layer_split_state, swa_cache_owner_rank,
@@ -47,7 +48,16 @@ class LayerSplitAttentionMixin:
     _compressed_kv_cache = DeepseekV4Attention._compressed_kv_cache
 
     def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
-        metadata = owner_swa_write_metadata(attn_metadata, self.swa_cache_layer.prefix)
+        prefix = self.swa_cache_layer.prefix
+        pages = active_prefill_pages()
+        if pages is not None and pages.can_fill_swa(prefix, attn_metadata):
+            # Native PCP gathers every input KV on each rank. Insert those
+            # same rows into the owner's cache and the peers' SWA scratch
+            # before attention consumes them, avoiding a second collective.
+            query = super()._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+            pages.local_swa_write = (prefix, attn_metadata)
+            return query
+        metadata = owner_swa_write_metadata(attn_metadata, prefix)
         return super()._fused_qnorm_rope_kv_insert(q, kv, positions, metadata)
 
     def forward_kv(self, positions, hidden_states):
@@ -67,6 +77,9 @@ class LayerSplitAttentionMixin:
         state = layer_split_state()
         if state is not None:
             prefix = self.swa_cache_layer.prefix
+            pages = active_prefill_pages()
+            if pages is not None and pages.take_local_swa(prefix, get_forward_context().attn_metadata):
+                return
             broadcast_kv_source_cache(prefix, swa_cache_owner_rank(prefix, state[0]),
                                       self.swa_cache_layer.kv_cache)
 

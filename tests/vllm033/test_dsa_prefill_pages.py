@@ -316,3 +316,25 @@ def test_swa_plan_selects_actual_replay_context():
                    state, torch.device('cpu'))
     assert mixed.ids(cut, replay_meta) is None
     assert mixed.ids(later, replay_meta).tolist() == [1, 2, 3, 21]
+
+
+def test_fresh_swa_scratch_is_valid_only_for_the_insert_and_its_reader():
+    from types import SimpleNamespace
+    from hcu_vllm_das.dsa_prefill_pages import PrefillPages
+
+    cut, later = 'model.layers.20.attn.swa_cache', 'model.layers.21.attn.swa_cache'
+    full_meta, replay_meta = {}, {}
+    replay = SimpleNamespace(forward_context=SimpleNamespace(attn_metadata=replay_meta))
+    plan = PrefillPages({cut: (1,), later: (2,)}, {},
+                        swa_replay_by_prefix={cut: (1,), later: (2,)},
+                        replay_layers=SimpleNamespace(first_swa_prefix=cut, replay_batch=replay))
+    assert plan.can_fill_swa(cut, full_meta)
+    assert not plan.can_fill_swa(cut, replay_meta)
+    assert plan.can_fill_swa(later, replay_meta)
+    assert not plan.can_fill_swa('unplanned.swa_cache', full_meta)
+    for prefix, meta in ((cut, replay_meta), (later, full_meta)):
+        plan.local_swa_write = (later, replay_meta)
+        assert not plan.take_local_swa(prefix, meta)
+    plan.local_swa_write = (later, replay_meta)
+    assert plan.take_local_swa(later, replay_meta)
+    assert not plan.take_local_swa(later, replay_meta)
