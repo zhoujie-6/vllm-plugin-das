@@ -265,3 +265,19 @@ def test_full_local_tensor_load_fills_all_expert_slots(monkeypatch):
     method.process_weights_after_loading(layer)
     _, packed_scales = method.moe_kernel.l2
     torch.testing.assert_close(packed_scales, rows.squeeze(-1))
+
+
+@pytest.mark.parametrize("extent,local,short", [(128, 128, True), (128, 0, True),
+                                                (257, 8, False), (None, 8, False)])
+def test_short_w4a8_tile_uses_common_extent(monkeypatch, extent, local, short):
+    monkeypatch.setattr(w4, "is_forward_context_available", lambda: extent is not None)
+    monkeypatch.setattr(w4, "get_forward_context", lambda: NS(batch_descriptor=NS(num_tokens=extent)))
+    selected = []
+    monkeypatch.setattr(w4.MegaExperts, "run", lambda self, *args: selected.append(self))
+    ex = object.__new__(w4.W4A8MegaExperts)
+    ex.buffer = NS(num_max_tokens_per_rank=4352)
+    ex.short_tile = object.__new__(w4._W4A8MegaTile)
+    ex.short_tile.buffer = NS(num_max_tokens_per_rank=256)
+    x = torch.empty((local, 8))
+    ex.run(x, x, x, x)
+    assert selected == [ex.short_tile if short else ex]

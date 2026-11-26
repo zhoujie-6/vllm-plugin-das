@@ -65,30 +65,10 @@ def stage_ct_w4a8(buf, x, ids, weights):
     buf.topk_weights[:rows].copy_(weights)
 
 
-class W4A8MegaExperts(MegaExperts):
+class _W4A8MegaTile(MegaExperts):
     @staticmethod
     def _supports_quant_scheme(weight_key, activation_key):
         return (weight_key, activation_key) == (kInt4Static, kInt8DynamicTokenSym)
-
-    def run(self, output, x, ids, weights):
-        # Core pads PCP inputs to the largest rank. Profile/replay may carry a
-        # full scheduler batch, while ordinary prefills fit in one local tile.
-        # Use the common descriptor even on ranks with fewer (or zero) rows.
-        extent = x.shape[0]
-        if is_forward_context_available():
-            desc = get_forward_context().batch_descriptor
-            if desc is not None:
-                extent = desc.num_tokens
-        if extent < x.shape[0]:
-            raise ValueError("PCP batch descriptor is smaller than the W4A8 input")
-        cap = self.buffer.num_max_tokens_per_rank
-        if extent <= cap:
-            return super().run(output, x, ids, weights)
-        if not is_forward_context_available() or desc is None:
-            raise ValueError("Oversize PCP batches require a common batch descriptor")
-        for start in range(0, max(1, extent), cap):
-            tile = slice(start, start + cap)
-            super().run(output[tile], x[tile], ids[tile], weights[tile])
 
     def stage(self, x, ids, weights):
         stage_ct_w4a8(self.buffer, x, ids, weights)
@@ -99,6 +79,34 @@ class W4A8MegaExperts(MegaExperts):
             activation_clamp=self.quant_config.gemm1_clamp_limit,
             combine_group_map=self.combine_groups,
         )
+
+
+class W4A8MegaExperts(_W4A8MegaTile):
+    short_tile = None
+
+    def run(self, output, x, ids, weights):
+        # Core pads PCP inputs to the largest rank. Profile/replay may carry a
+        # full scheduler batch, while ordinary prefills fit in one local tile.
+        # Use the common descriptor even on ranks with fewer (or zero) rows.
+        extent = x.shape[0]
+        desc = None
+        if is_forward_context_available():
+            desc = get_forward_context().batch_descriptor
+            if desc is not None:
+                extent = desc.num_tokens
+        if extent < x.shape[0]:
+            raise ValueError("PCP batch descriptor is smaller than the W4A8 input")
+        if (desc is not None and self.short_tile is not None
+                and extent <= self.short_tile.buffer.num_max_tokens_per_rank):
+            return self.short_tile.run(output, x, ids, weights)
+        cap = self.buffer.num_max_tokens_per_rank
+        if extent <= cap:
+            return super().run(output, x, ids, weights)
+        if desc is None:
+            raise ValueError("Oversize PCP batches require a common batch descriptor")
+        for start in range(0, max(1, extent), cap):
+            tile = slice(start, start + cap)
+            super().run(output[tile], x[tile], ids[tile], weights[tile])
 
 
 class _MegaMoEPackedParameters(PackedCTParameters):
@@ -227,6 +235,18 @@ class HcuDSV41W4A8MegaMoEMethod(DSV41MegaMoEMethodMixin, CompressedTensorsW4A8In
                 owners = [index // (logical // ep.world_size) for index in placement]
                 if any(owner != index // p1.shape[0] for index, owner in enumerate(owners)):
                     experts.combine_groups = torch.tensor(owners, dtype=torch.int32, device=p1.device)
+            # The provider sizes its route scans and GEMM workspaces from
+            # buffer capacity. Use a shared short tile for bounded replay.
+            # Large batches and ranks without a common descriptor retain the
+            # original buffer and tiling. Both buffers enter memory profiling.
+            if self.buffer_capacity > 256:
+                with _layer_buffer(ep, self.mega, w1.device, self.moe, 256, "w4a8") as short:
+                    tile = _W4A8MegaTile(self.moe, quant, short, (p1, s1), (p2, s2), self.mega)
+                    tile.combine_groups = experts.combine_groups
+                    if not getattr(short, "_hcu_workspace_ready", False):
+                        tile.launch(torch.empty((0, h), dtype=torch.bfloat16, device=w1.device))
+                        short._hcu_workspace_ready = True
+                    experts.short_tile = tile
             self.moe_kernel = MegaKernel(MegaPrepare(), experts)
             self._packed.state = "ready"
             self._processed = True
