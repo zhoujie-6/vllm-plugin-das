@@ -284,6 +284,18 @@ class Fp4LayerSplitIndexer(LayerSplitIndexerMixin, Fp4Indexer):
 class Fp4LayerSplitPcpAttention(LayerSplitAttentionMixin, Fp4PcpAttention):
     """FP4 constructors plus shared main/SWA ownership and bounded replay."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        cfg = kwargs.get('vllm_config') or get_current_vllm_config()
+        self._hcu_pcp_wo_a = wo_a_layout.pcp_configured(cfg, self)
+
+    def _o_proj(self, attn_out, positions):
+        if self._hcu_pcp_wo_a:
+            result = wo_a_layout.pcp_project(self, attn_out)
+            if result is not None:
+                return self._wo_b_after_wo_a(result)
+        return super()._o_proj(attn_out, positions)
+
     def _indexer_cls(self, k_cache):
         return Fp4LayerSplitIndexer
 

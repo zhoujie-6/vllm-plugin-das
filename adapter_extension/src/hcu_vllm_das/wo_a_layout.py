@@ -194,6 +194,56 @@ def project(owner, attn_out):
     return output
 
 
+def pcp_configured(cfg, owner):
+    weight = owner.wo_a.weight
+    if (weight.device.type != 'cuda' or weight.dtype != torch.bfloat16
+            or tuple(weight.shape) != (8192, 4096)
+            or (owner.n_local_heads, owner.n_local_groups, owner.o_lora_rank) != (64, 8, 1024)
+            or cfg.model_config.quantization != 'hcu_dsv41_ct_w4a8'
+            or not cfg.model_config.enforce_eager
+            or cfg.parallel_config.prefill_context_parallel_size != 8
+            or cfg.kernel_config.moe_backend != 'deep_gemm_mega_moe'
+            or not _cache_contract(native._get_cached_wo_a_bf16)[0]):
+        return False
+    return _qualify_pcp(weight.device, native._get_cached_wo_a_bf16)
+
+
+@lru_cache(maxsize=8)
+@torch.inference_mode()
+def _qualify_pcp(device, cache):
+    # The serving script supplies a custom rocBLAS solution library. Check
+    # the installed BMM against the native projection with that library.
+    props = torch.cuda.get_device_properties(device)
+    if getattr(props, 'gcnArchName', '').split(':')[0] != 'gfx938' or props.multi_processor_count != 64:
+        return False
+    generator = torch.Generator(device=device).manual_seed(7004)
+    try:
+        weight = torch.randn((8192, 4096), dtype=torch.bfloat16, device=device, generator=generator)
+        owner = SimpleNamespace(n_local_heads=64, n_local_groups=8, o_lora_rank=1024,
+                                rotary_emb=None, rope_head_dim=64, wo_a=SimpleNamespace(weight=weight),
+                                _wo_b_after_wo_a=lambda value: value)
+        for rows in (16, 128, 512, 1024, 4096):
+            x = torch.randn((rows, 64, 512), dtype=torch.bfloat16, device=device, generator=generator)
+            if not torch.equal(_O_PROJ(owner, x, None), _project(cache, owner.wo_a, x)):
+                _LOG.info('PCP WO-A native parity check failed for %d rows', rows)
+                return False
+    except (RuntimeError, ValueError, TypeError, AttributeError) as error:
+        _LOG.info('PCP WO-A native parity check unavailable: %s', error)
+        return False
+    _LOG.info('Enabled native-checked PCP WO-A token-major projection on %s', device)
+    return True
+
+
+def pcp_project(owner, attn_out):
+    if (not isinstance(attn_out, torch.Tensor) or attn_out.dtype != torch.bfloat16
+            or attn_out.ndim != 3 or attn_out.shape[1:] != (64, 512)
+            or not 0 < attn_out.shape[0] <= 4096 or not attn_out.is_contiguous()
+            or torch.is_grad_enabled() or torch.is_autocast_enabled('cuda')
+            or attn_out.device != owner.wo_a.weight.device):
+        return None
+    return _project(native._get_cached_wo_a_bf16, owner.wo_a, attn_out)
+
+
 def _project(cache, wo_a, attn_out):
     rows = attn_out.shape[0]
     inputs = attn_out[:, :64, :].reshape(rows, 8, 4096)
