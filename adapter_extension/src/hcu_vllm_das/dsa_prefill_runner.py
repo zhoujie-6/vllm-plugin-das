@@ -118,7 +118,11 @@ class LayerSplitPrefillRunnerMixin:
                     for prefix in group.prefixes:
                         by_prefix[prefix] = ids
                         group_by_prefix[prefix] = group.slot
-                pages = PrefillPages(by_prefix, group_by_prefix)
+                # A partial first chunk has fresh pages too. Preserve Core's
+                # partition and KV transport when a later step must resume it.
+                complete = all(scheduler_output.num_scheduled_tokens[req.req_id] == len(req.prompt_token_ids)
+                               for req in scheduler_output.scheduled_new_reqs)
+                pages = PrefillPages(by_prefix, group_by_prefix, complete_prompts=complete)
                 _add_swa_pages(pages, swa_groups, scheduler_output,
                                getattr(self, 'model_state', None), self.device)
         # The native replay view is rebuilt from the same physical block

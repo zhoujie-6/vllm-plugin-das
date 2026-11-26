@@ -120,13 +120,14 @@ class PrefillPages:
     swa_replay_by_prefix: dict = field(default_factory=dict)
     replay_layers: object | None = None
 
+    complete_prompts: bool = False
     local_swa_write: tuple[str, object] | None = None
 
     def can_fill_swa(self, prefix, metadata):
         # Only independent SWA pools with known fresh pages are registered.
         # The replay cut reads a halo written by the separate full-batch KV
         # pass. Its compact insert alone cannot populate that halo.
-        if prefix not in self.by_prefix or not prefix.endswith('.swa_cache'):
+        if not self.complete_prompts or prefix not in self.by_prefix or not prefix.endswith('.swa_cache'):
             return False
         layers = self.replay_layers
         replay = None if layers is None else layers.replay_batch

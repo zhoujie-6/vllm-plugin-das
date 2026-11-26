@@ -8,6 +8,8 @@ from vllm.logger import init_logger
 from vllm.models.deepseek_v41.nvidia.model_state import DeepseekV41ModelState
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
+from ..dsa_prefill_pages import active_prefill_pages
+
 
 logger = init_logger('vllm.' + __name__)
 
@@ -29,7 +31,9 @@ class WindowBalancedPCPManager(PCPManager):
 
     def _balanced(self, lengths, prefilling):
         peers = self.pcp_world_size
-        return (len(lengths) > 0 and prefilling.all()
+        pages = active_prefill_pages()
+        return (pages is not None and pages.complete_prompts
+                and len(lengths) > 0 and prefilling.all()
                 and (lengths >= 2 * peers * self.window).all()
                 and (lengths % peers == 0).all())
 

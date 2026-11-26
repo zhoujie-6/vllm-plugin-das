@@ -327,11 +327,15 @@ def test_fresh_swa_scratch_is_valid_only_for_the_insert_and_its_reader():
     replay = SimpleNamespace(forward_context=SimpleNamespace(attn_metadata=replay_meta))
     plan = PrefillPages({cut: (1,), later: (2,)}, {},
                         swa_replay_by_prefix={cut: (1,), later: (2,)},
-                        replay_layers=SimpleNamespace(first_swa_prefix=cut, replay_batch=replay))
+                        replay_layers=SimpleNamespace(first_swa_prefix=cut, replay_batch=replay),
+                        complete_prompts=True)
     assert plan.can_fill_swa(cut, full_meta)
     assert not plan.can_fill_swa(cut, replay_meta)
     assert plan.can_fill_swa(later, replay_meta)
     assert not plan.can_fill_swa('unplanned.swa_cache', full_meta)
+    plan.complete_prompts = False
+    assert not plan.can_fill_swa(cut, full_meta)
+    assert not plan.can_fill_swa(later, replay_meta)
     for prefix, meta in ((cut, replay_meta), (later, full_meta)):
         plan.local_swa_write = (later, replay_meta)
         assert not plan.take_local_swa(prefix, meta)
