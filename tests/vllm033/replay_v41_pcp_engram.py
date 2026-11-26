@@ -60,12 +60,25 @@ class Group:
     def all_gather(self,x,dim):return self.collect(x,dim)
 
 def configure(stack,c,rank=0,tp_size=1):
-    group=Group();group.rank_in_group=rank
+    pcp_group = Group()
+    pcp_group.rank_in_group = rank
+    pcp_group.device_group = object()
+
+    def exchange(output, staged, *, group):
+        assert group is pcp_group.device_group
+        # The reference has every row and head in logical order. Fill this
+        # rank's receive buffer in transport order, one block per source.
+        full = pcp_group.collect(staged, dim=1)
+        local = full.chunk(pcp_group.world_size, dim=0)[pcp_group.rank_in_group]
+        blocks = local.split(staged.shape[1], dim=1)
+        output.copy_(torch.cat(blocks, dim=0))
+
+    stack.enter_context(patch.object(torch.distributed, 'all_to_all_single', exchange))
     hip=Hip()
     stack.enter_context(patch.object(prod,'get_current_vllm_config',return_value=c))
     stack.enter_context(patch.object(native,'get_current_vllm_config',return_value=c))
     stack.enter_context(patch.dict(prod.HcuV41PcpEngram._create_embedding.__globals__,get_current_vllm_config=lambda:c))
-    stack.enter_context(patch.object(prod,'get_pcp_group',return_value=group))
+    stack.enter_context(patch.object(prod,'get_pcp_group',return_value=pcp_group))
     stack.enter_context(patch.object(native,'get_engram_dp_size',return_value=1))
     stack.enter_context(patch.object(native,'is_uva_available',return_value=True))
     stack.enter_context(patch.object(native,'get_tensor_model_parallel_world_size',return_value=tp_size))
@@ -74,7 +87,7 @@ def configure(stack,c,rank=0,tp_size=1):
     stack.enter_context(patch.object(torch.Tensor,'is_pinned',return_value=True))
     stack.enter_context(patch.object(torch.cuda,'get_device_properties',return_value=NS(multi_processor_count=8)))
     stack.enter_context(patch.object(torch.accelerator,'current_device_index',return_value=0))
-    return group,hip
+    return pcp_group,hip
 
 class Projection(torch.nn.Module):
     def __init__(self,*args,**kwargs):super().__init__();self.width=args[1];self.inputs=[]

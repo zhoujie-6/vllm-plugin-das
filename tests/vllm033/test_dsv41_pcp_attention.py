@@ -143,8 +143,7 @@ def test_pcp_engram_stages_uneven_and_empty_ranks(monkeypatch, counts, rank):
     def gather(value, dim=0):
         if value.dtype == torch.int64:
             return torch.tensor(counts, dtype=torch.int64)
-        if dim == 1:
-            return torch.zeros(slot * 8, heads, 2)
+        assert dim == 0
         expected = torch.full((slot, heads), engram.native.DEAD_ID, dtype=torch.int32)
         expected[:counts[rank]] = hashes[rank]
         assert torch.equal(value, expected)
@@ -154,7 +153,16 @@ def test_pcp_engram_stages_uneven_and_empty_ranks(monkeypatch, counts, rank):
             p[:len(h)] = h
             padded.append(p)
         return torch.cat(padded)
-    monkeypatch.setattr(engram, "get_pcp_group", lambda: NS(world_size=8, rank_in_group=rank, all_gather=gather))
+    device_group = object()
+    pcp = NS(world_size=8, rank_in_group=rank, all_gather=gather, device_group=device_group)
+    monkeypatch.setattr(engram, "get_pcp_group", lambda: pcp)
+
+    def exchange(output, staged_rows, *, group):
+        assert group is device_group and slot > 0
+        assert staged_rows.shape == (8 * slot, local_heads, dim)
+        output.zero_()
+
+    monkeypatch.setattr(torch.distributed, "all_to_all_single", exchange)
     obj = object.__new__(engram.HcuV41PcpEngram)
     torch.nn.Module.__init__(obj)
     obj.embed_tokens = NS(n_hash_cols=heads, part_n_hash_cols=local_heads, dim=dim,
@@ -212,8 +220,16 @@ def test_head_exchange_selects_pcp_local_tokens(monkeypatch, rank, slot, count):
     obj.embed_tokens = NS(n_hash_cols=24, part_n_hash_cols=3, dim=2, tp_size=1,
                          _hcu_pcp_size=8, _hcu_pcp_rank=rank)
     obj._hcu_prepared = (count, slot)
-    monkeypatch.setattr(engram, "get_pcp_group", lambda: NS(
-        world_size=size, rank_in_group=rank, all_gather=lambda value, dim: heads))
+    device_group = object()
+    pcp = NS(world_size=size, rank_in_group=rank, device_group=device_group)
+    monkeypatch.setattr(engram, "get_pcp_group", lambda: pcp)
+
+    def exchange(output, staged_rows, *, group):
+        assert group is device_group
+        assert torch.equal(staged_rows, complete[rank])
+        output.copy_(torch.cat([sender[rank*slot:(rank+1)*slot] for sender in complete]))
+
+    monkeypatch.setattr(torch.distributed, "all_to_all_single", exchange)
     monkeypatch.setattr(engram.native.Engram, "_ready_rows", lambda self,n: complete[rank])
     actual = obj.embed(torch.zeros(count, 24, dtype=torch.int32))
     assert torch.equal(actual, heads[rank*slot:rank*slot+count])

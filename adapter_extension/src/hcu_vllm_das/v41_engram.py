@@ -145,13 +145,16 @@ class HcuV41PcpEngram(native.Engram):
         table, group = self.embed_tokens, self._group()
         if not slot:
             return self.staged_rows.new_empty((0, table.n_hash_cols, table.dim))
-        staged = self._ready_rows(slot * group.world_size)
-        rows = group.all_gather(staged.contiguous(), dim=1)
-        expected = (slot * group.world_size, table.part_n_hash_cols * group.world_size, table.dim)
-        if tuple(rows.shape) != expected:
-            raise RuntimeError('HCU PCP Engram head collective returned an invalid layout')
-        start = group.rank_in_group * slot
-        rows = rows[start:start + count]
+        staged = self._ready_rows(slot * group.world_size).contiguous()
+        if staged.shape != (slot * group.world_size, table.part_n_hash_cols, table.dim):
+            raise RuntimeError('HCU PCP Engram staging returned an invalid row layout')
+        # Each source owns a shard of the heads. Its rows are already grouped
+        # by destination PCP rank, with the same padded row count for each.
+        received = torch.empty_like(staged)
+        torch.distributed.all_to_all_single(received, staged, group=group.device_group)
+        shards = received.view(group.world_size, slot, table.part_n_hash_cols, table.dim)
+        rows = shards[:, :count].transpose(0, 1).reshape(
+            count, group.world_size * table.part_n_hash_cols, table.dim)
         if table.tp_size > 1:
             rows = tensor_model_parallel_all_gather(rows, dim=1)
         return rows[:, :table.n_hash_cols]
