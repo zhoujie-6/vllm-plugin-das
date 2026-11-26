@@ -88,6 +88,14 @@ def _add_swa_pages(pages, groups, batch, model_state, device):
 
 
 class LayerSplitPrefillRunnerMixin:
+    @property
+    def pcp_manager_cls(self):
+        from .dsv41.pcp_replay import WindowBalancedPCPManager, supports_balanced_replay
+
+        if supports_balanced_replay(self.vllm_config):
+            return WindowBalancedPCPManager
+        return super().pcp_manager_cls
+
     def execute_model(self, scheduler_output, intermediate_tensors=None, *args, **kwargs):
         pages = None
         # Core passes dummy_run as a keyword. Positional optional arguments

@@ -238,7 +238,15 @@ _EPLB_OUTER_INIT = _constructor(_OUTER_NATIVE, _REVIEWED[2],
 
 
 class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
+    def get_model_state_cls(self):
+        from ..dsv41.pcp_replay import WindowBalancedModelState, supports_balanced_replay
+
+        if supports_balanced_replay(self._hcu_pcp_config):
+            return WindowBalancedModelState
+        return super().get_model_state_cls()
+
     def __init__(self, *, vllm_config, prefix=''):
+        self._hcu_pcp_config = vllm_config
         self._hcu_static_eplb_config = None
         uses_pcp = vllm_config.parallel_config.prefill_context_parallel_size > 1
         if uses_pcp:

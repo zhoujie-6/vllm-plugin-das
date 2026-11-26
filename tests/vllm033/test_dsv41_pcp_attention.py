@@ -233,3 +233,42 @@ def test_head_exchange_selects_pcp_local_tokens(monkeypatch, rank, slot, count):
     monkeypatch.setattr(engram.native.Engram, "_ready_rows", lambda self,n: complete[rank])
     actual = obj.embed(torch.zeros(count, 24, dtype=torch.int32))
     assert torch.equal(actual, heads[rank*slot:rank*slot+count])
+
+
+@pytest.mark.parametrize("lengths", [[4096] * 8, [2048, 4096, 6144], [65536]])
+def test_balanced_pcp_replay_covers_every_position_once(lengths):
+    import numpy as np
+    from hcu_vllm_das.dsv41.pcp_replay import WindowBalancedPCPManager
+
+    manager = object.__new__(WindowBalancedPCPManager)
+    manager.pcp_world_size = 8
+    seen = [np.zeros(n, dtype=np.uint8) for n in lengths]
+    prefills = np.ones(len(lengths), dtype=np.bool_)
+    for rank in range(8):
+        per_request = np.zeros(len(lengths), dtype=np.int64)
+        tail = per_request.copy()
+        for request, start, size in manager._iter_rank_chunks(rank, np.array(lengths), prefills):
+            end = start + size
+            seen[request][start:end] += 1
+            per_request[request] += size
+            tail[request] += max(0, end - max(start, lengths[request] - manager.window))
+        np.testing.assert_array_equal(per_request * 8, lengths)
+        assert (tail * 8 == manager.window).all()
+    assert all((counts == 1).all() for counts in seen)
+
+
+@pytest.mark.parametrize("lengths,prefills", [([4096, 4101], [True, True]),
+                                              ([4096, 1], [True, False]),
+                                              ([1024], [True])])
+def test_balanced_pcp_replay_delegates_other_batches(lengths, prefills):
+    import numpy as np
+    from vllm.v1.worker.gpu.pcp_manager import PCPManager
+    from hcu_vllm_das.dsv41.pcp_replay import WindowBalancedPCPManager
+
+    manager = object.__new__(WindowBalancedPCPManager)
+    manager.pcp_world_size = 8
+    manager.dcp_world_size = 1
+    manager.shard_decode_requests = True
+    for rank in range(8):
+        args = rank, np.array(lengths), np.array(prefills)
+        assert list(manager._iter_rank_chunks(*args)) == list(PCPManager._iter_rank_chunks(manager, *args))
