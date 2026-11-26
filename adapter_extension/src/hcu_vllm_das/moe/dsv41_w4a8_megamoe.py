@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Packed CT INT4 weights and token-INT8 activations for DSV4.1 MegaMoE."""
-from functools import wraps
+from functools import cache, wraps
 
 import torch
 
@@ -36,7 +36,25 @@ def pack_ct_hipc(words):
     return pack_w4a8_moe_hipc_weight(convert_ct_int4_to_hipc_bytes_(words))
 
 
+@cache
+def _fused_stage():
+    # Older standalone wheels only expose the separate LightOp quantizer.
+    try:
+        from megamoe._w4a8_staging import stage_inputs
+    except ModuleNotFoundError as error:
+        if error.name != "megamoe._w4a8_staging":
+            raise
+        return None
+    return stage_inputs
+
+
 def stage_ct_w4a8(buf, x, ids, weights):
+    if x.is_contiguous() and ids.is_contiguous() and weights.is_contiguous():
+        stage = _fused_stage()
+        if stage is not None:
+            stage(x, ids, weights, buf)
+            return
+
     from lightop.quant import per_token_quant_int8
 
     rows = x.shape[0]

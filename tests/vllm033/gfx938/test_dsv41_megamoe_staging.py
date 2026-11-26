@@ -8,7 +8,8 @@ from hcu_vllm_das.moe.dsv41_w4a8_megamoe import stage_ct_w4a8
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not torch.version.hip, reason="HCU required")
-def test_staging_writes_only_active_rows():
+@pytest.mark.parametrize("contiguous", [False, True])
+def test_staging_writes_only_active_rows(contiguous):
     rows, hidden, topk = 17, 5120, 6
     device = "cuda"
     x = torch.randn((rows, hidden), dtype=torch.bfloat16, device=device)
@@ -17,6 +18,8 @@ def test_staging_writes_only_active_rows():
     x[2, :5] = x.new_tensor([127, 1.5, -1.5, 2.5, -2.5])
     ids = torch.arange(topk, device=device, dtype=torch.int32).expand(rows, -1)
     weights = torch.rand((rows, topk * 2), device=device)[:, ::2]
+    if contiguous:
+        ids, weights = ids.contiguous(), weights.contiguous()
     buf = SimpleNamespace(
         x=torch.full((rows + 1, hidden), -7, device=device, dtype=torch.int8),
         x_sf=torch.full((rows + 1,), -7., device=device),
