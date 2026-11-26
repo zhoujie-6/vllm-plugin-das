@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Packed CT INT4 weights and token-INT8 activations for DSV4.1 MegaMoE."""
+from functools import wraps
+
 import torch
 
 from vllm.distributed import get_ep_group
@@ -122,6 +124,54 @@ class W4A8MegaExperts(MegaExperts):
         native(*args, per_token_intermediate=True)
 
 
+class _MegaMoEPackedParameters(PackedCTParameters):
+    """Track successful native loads into the local physical expert slots."""
+
+    _projections = {"w1": "gate", "w3": "up", "w2": "down"}
+
+    def __init__(self, layer, num_experts, hidden_size, intermediate_size, weight_loader):
+        super().__init__(layer, num_experts, hidden_size, intermediate_size, weight_loader)
+        fields = ("weight_packed", "weight_scale")
+        self._missing = {
+            (slot, shard, field)
+            for slot in range(num_experts) for shard in self._projections for field in fields
+        }
+        for stem in ("w13", "w2"):
+            for field in fields:
+                param = getattr(layer, f"{stem}_{field}")
+                param.weight_loader = self._track_load(param.weight_loader, field)
+
+    def _track_load(self, loader, field):
+        # Static EPLB unwraps the native owner for validation, then calls this
+        # wrapper for each physical replica. Preserve the bound loader signature.
+        @wraps(loader)
+        def load(param, loaded_weight, weight_name, shard_id, expert_id, return_success=False):
+            success = loader(param, loaded_weight, weight_name, shard_id, expert_id,
+                             return_success=True)
+            if success:
+                if loaded_weight.ndim == 3:
+                    # RoutedExperts writes the full leading expert axis in this case.
+                    if loaded_weight.shape[0] != self.shape[0]:
+                        raise ValueError("Expected a full batch of local W4A8 expert shards")
+                    for slot in range(self.shape[0]):
+                        self._missing.discard((slot, shard_id, field))
+                else:
+                    slot = self.layer.expert_map_manager.map_global_to_local(expert_id)
+                    self._missing.discard((slot, shard_id, field))
+            return success if return_success else None
+
+        return load
+
+    def require_complete(self, prefix):
+        if self._missing:
+            slot, shard, field = min(self._missing)
+            raise RuntimeError(
+                f"Incomplete W4A8 checkpoint for {prefix}: local expert {slot}, "
+                f"projection {self._projections[shard]}, missing {field} "
+                f"({len(self._missing)} missing shards in this layer)"
+            )
+
+
 class HcuDSV41W4A8MegaMoEMethod(DSV41MegaMoEMethodMixin, CompressedTensorsW4A8Int8MoEMethod):
     supports_static_eplb = True
     supports_swa_bounded_replay = True
@@ -140,9 +190,9 @@ class HcuDSV41W4A8MegaMoEMethod(DSV41MegaMoEMethodMixin, CompressedTensorsW4A8In
 
     def create_weights(self, layer, num_experts, hidden_size,
                        intermediate_size_per_partition, params_dtype, **extra_weight_attrs):
-        self._packed = PackedCTParameters(layer, num_experts, hidden_size,
-                                          intermediate_size_per_partition,
-                                          extra_weight_attrs.get("weight_loader"))
+        self._packed = _MegaMoEPackedParameters(
+            layer, num_experts, hidden_size, intermediate_size_per_partition,
+            extra_weight_attrs.get("weight_loader"))
         extra = {k: v for k, v in extra_weight_attrs.items()
                  if k not in ("weight_loader", "is_transposed", "quant_method")}
         for param in layer.parameters(recurse=False):
@@ -163,6 +213,7 @@ class HcuDSV41W4A8MegaMoEMethod(DSV41MegaMoEMethodMixin, CompressedTensorsW4A8In
             raise RuntimeError(
                 f"Cannot pack W4A8 MegaMoE weights: expected loaded state, got {self._packed.state!r}"
             )
+        self._packed.require_complete(self._prefix)
         if (layer.apply_router_weight_on_input or layer.expert_map_manager.num_fused_shared_experts
                 or layer.swiglu_limit != 10.0):
             raise ValueError("DSV4.1 W4A8 requires separate shared experts, output routing and clamp=10")
