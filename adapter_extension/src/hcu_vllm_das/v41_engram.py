@@ -11,11 +11,13 @@ import inspect
 from types import FunctionType
 import torch
 from vllm.config import get_current_vllm_config
+from vllm.forward_context import get_forward_context
 from vllm.distributed import (get_pcp_group, get_tensor_model_parallel_rank,
                               tensor_model_parallel_all_gather)
 from vllm.models.deepseek_v41.common import engram as native
 from vllm.logger import init_logger
 from .engram_host import allocate_table, check_table_storage
+from .dsa_prefill_pages import active_prefill_pages
 
 logger = init_logger(__name__)
 
@@ -120,15 +122,26 @@ class HcuV41PcpEngram(native.Engram):
                 or hash_ids.shape[1] != table.n_hash_cols):
             raise ValueError('HCU PCP Engram requires int32 [local tokens, hash heads]')
         count = hash_ids.shape[0]
-        counts = group.all_gather(torch.tensor([count], dtype=torch.int64, device=hash_ids.device), dim=0)
-        if counts.numel() != group.world_size or bool((counts < 0).any().item()):
-            raise RuntimeError('HCU PCP Engram count collective has incompatible membership')
-        slot = int(counts.max().item())
+        # The fresh-prefill runner uses Core's common PCP extent on every
+        # rank. Reuse it so the GPU need not synchronize with the host twice
+        # before each layer's embedding lookup.
+        desc = get_forward_context().batch_descriptor if active_prefill_pages() is not None else None
+        if desc is None:
+            counts = group.all_gather(torch.tensor([count], dtype=torch.int64, device=hash_ids.device), dim=0)
+            if counts.numel() != group.world_size or bool((counts < 0).any().item()):
+                raise RuntimeError('HCU PCP Engram count collective has incompatible membership')
+            slot = int(counts.max().item())
+        else:
+            slot = desc.num_tokens
+            if slot < count:
+                raise ValueError('HCU PCP Engram rows exceed the common batch descriptor')
         if slot * group.world_size > self.staged_rows.shape[0]:
             raise ValueError('HCU PCP Engram hash rows exceed persistent staging capacity')
         if slot:
-            padded = hash_ids.new_full((slot, table.n_hash_cols), native.DEAD_ID)
-            padded[:count].copy_(hash_ids)
+            padded = hash_ids
+            if count != slot:
+                padded = hash_ids.new_full((slot, table.n_hash_cols), native.DEAD_ID)
+                padded[:count].copy_(hash_ids)
             gathered = group.all_gather(padded.contiguous(), dim=0)
             if gathered.shape != (slot * group.world_size, table.n_hash_cols):
                 raise RuntimeError('HCU PCP Engram hash collective returned an invalid row layout')

@@ -136,12 +136,17 @@ def test_engram_staging_capacity_matches_padded_pcp_gather(monkeypatch, worker, 
 
 
 @pytest.mark.parametrize("counts,rank", [([0]*8, 0), ([0,2,1,0,3,0,1,2], 0), ([0,2,1,0,3,0,1,2], 4)])
-def test_pcp_engram_stages_uneven_and_empty_ranks(monkeypatch, counts, rank):
+@pytest.mark.parametrize("common_descriptor", [False, True])
+def test_pcp_engram_stages_uneven_and_empty_ranks(monkeypatch, counts, rank, common_descriptor):
     heads, local_heads, dim = 24, 3, 2
     hashes = [torch.arange(n * heads, dtype=torch.int32).reshape(n, heads) + 1000*r for r,n in enumerate(counts)]
     slot = max(counts)
+    if common_descriptor:
+        monkeypatch.setattr(engram, "active_prefill_pages", lambda: object())
+        monkeypatch.setattr(engram, "get_forward_context", lambda: NS(batch_descriptor=NS(num_tokens=slot)))
     def gather(value, dim=0):
         if value.dtype == torch.int64:
+            assert not common_descriptor
             return torch.tensor(counts, dtype=torch.int64)
         assert dim == 0
         expected = torch.full((slot, heads), engram.native.DEAD_ID, dtype=torch.int32)
