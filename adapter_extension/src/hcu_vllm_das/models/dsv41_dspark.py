@@ -67,6 +67,9 @@ class HcuDSparkDeepseekV41ForCausalLM(HcuDSV41DraftWeightAliasModel):
         else:
             constructor(vllm_config=vllm_config, prefix=prefix)
 
+        from ..quantization.v41_int8_projections import configure_draft
+        configure_draft(self, constructor_config)
+
         # Draft decoder layers use the native constructor, so the target's
         # HcuV41Fp4DecoderLayer activation binding never visits them. Reuse the
         # same guarded consumer contract with the actual construction config;

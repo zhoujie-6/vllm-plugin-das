@@ -290,6 +290,9 @@ class HcuV41PcpForCausalLM(native_vl.DeepseekV41ForCausalLM):
                 # PCP1 without the explicit host route remains fully native.
                 super().__init__(vllm_config=vllm_config, prefix=prefix)
 
+        from ..quantization.v41_int8_projections import configure_target
+        configure_target(self, vllm_config)
+
         if uses_pcp:
             from ..inverse_rope_pcp import prepare_worker_model
 

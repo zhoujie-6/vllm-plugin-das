@@ -83,6 +83,7 @@ def test_owned_model_binds_private_config_and_restores_parent():
 
     def native_init(self, *, vllm_config, prefix=''):
         torch.nn.Module.__init__(self)
+        self.model = NS(layers=[], markov_head=NS(markov_w2=None))
         assert vllm_config is get_current_vllm_config()
         assert vllm_config.parallel_config.prefill_context_parallel_size == 1
         seen.append(moe_pcp_size(vllm_config))
